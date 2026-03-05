@@ -721,19 +721,37 @@ def process_data(df: pd.DataFrame, selected_prods: list,
         dedup_use = dedup
 
     # ── Step 3: Pivot & consumption diff from CLEAN indicators ────────────
-    # At this point Water_Indicator in dedup_use has been chain-corrected:
-    # - digit prefix errors → stripped to correct value
-    # - meter replacements  → chain shifted so diffs are valid
-    # - IQR spikes          → indicator capped at prev + outlier_upper
-    # - negative anomalies  → indicator set to prev (usage = 0)
-    # The diff() below should produce only clean non-negative values.
     pivot = (dedup_use.pivot(index='Date', columns='Pompa', values='Water_Indicator')
                        .sort_index())
 
-    cons = pivot.diff()
-    cons.iloc[0] = 0
-    # Final safety net: any remaining negatives → 0, any remaining spikes → cap
-    # (should be rare after preprocessing, but protects chart display)
+    cons_raw = pivot.diff()
+    cons_raw.iloc[0] = 0
+
+    # ── Step 4: Gap-aware daily averaging ────────────────────────────────
+    # Kalau ada tanggal yang skip (misal data bulan depan baru masuk setelah
+    # 29 hari kosong), pivot.diff() akan mengembalikan TOTAL usage N hari
+    # sekaligus di 1 baris — terlihat seperti spike padahal normal.
+    #
+    # Fix: hitung gap (selisih hari antar tanggal berurutan). Kalau gap > 1,
+    # bagi usage secara rata ke setiap hari dalam gap tersebut.
+    #
+    # Contoh: 2025-03-13 → 2025-04-11 (gap 29 hari), usage 749 m³
+    #   → tiap hari dalam range itu: 749 / 29 ≈ 25.8 m³/hari  ✓
+    #   vs tanpa gap handling: 749 m³ di 1 hari → kena flag spike  ✗
+
+    GAP_THRESHOLD_DAYS = 2   # gap ≥ 2 hari → distribusi rata
+
+    # Hitung gap antar tanggal yang benar-benar ada di data (bukan kalender penuh)
+    dates_present = pivot.index  # DatetimeIndex, sudah sorted
+    date_gaps     = pd.Series(dates_present).diff().dt.days.fillna(1).values  # gap[i] = tanggal[i] - tanggal[i-1]
+
+    cons = cons_raw.copy()
+    for i, gap in enumerate(date_gaps):
+        if gap >= GAP_THRESHOLD_DAYS:
+            # Bagi usage secara rata ke tiap hari dalam gap
+            cons.iloc[i] = cons_raw.iloc[i] / gap
+
+    # Final safety net
     cons = cons.clip(lower=0, upper=max_spike)
 
     return pivot, cons, dedup_use, loc_map, df_ann, df_clean
@@ -1827,7 +1845,7 @@ def generate_html_report(
   <div class="logo">💧</div>
   <div>
     <div class="header-title">Water Consumption Dashboard</div>
-    <div class="header-sub">Daily water consumption analysis from Water Meter Raw Data</div>
+    <div class="header-sub">Daily water consumption analysis from Water Meter Raw Data — Plant 1</div>
   </div>
   <div class="badge">📅 {period_str} &nbsp;|&nbsp; {n_days} days</div>
 </div>
@@ -1941,7 +1959,7 @@ with st.sidebar:
     uploaded = st.file_uploader(
         "Upload waterawdata file (*.xlsx)",
         type=['xlsx'],
-        help="Upload waterawdata.xlsx or any file with the same format"
+        help="Upload waterawdata_GI.xlsx or any file with the same format"
     )
 
     st.markdown("---")
@@ -2050,7 +2068,7 @@ if uploaded is None or raw_df.empty:
       <div style="font-size:24px;font-weight:700;color:#0c4a6e;margin-bottom:12px;">
         Upload Your Water Meter Data File</div>
       <div style="font-size:15px;color:#64748b;max-width:500px;margin:0 auto 32px;">
-        Upload <b>waterawdata.xlsx</b> or a file with the same format via the sidebar
+        Upload <b>waterawdata_GI.xlsx</b> or a file with the same format via the sidebar
         to start analysing water consumption.
       </div>
       <div style="display:flex;justify-content:center;gap:24px;flex-wrap:wrap;">
@@ -2616,5 +2634,3 @@ st.markdown("""
   PT Güntner Indonesia &nbsp;|&nbsp; Water Monitoring System
 </div>
 """, unsafe_allow_html=True)
-
-
