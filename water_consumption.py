@@ -687,8 +687,11 @@ def get_anomaly_summary(df_annotated: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 
 def process_data(df: pd.DataFrame, selected_prods: list,
-                 dedup_method: str, max_spike: float,
+                 dedup_method: str,
                  preprocess_strategy: str = 'flag_only'):
+    # max_spike: hardcoded sangat tinggi — anomaly detection sudah handle
+    # spike via MIN_ABSOLUTE_SPIKE, tidak perlu user-facing clip lagi
+    max_spike = 999_999.0
     if df.empty or not selected_prods:
         return None
 
@@ -751,8 +754,11 @@ def process_data(df: pd.DataFrame, selected_prods: list,
             # Bagi usage secara rata ke tiap hari dalam gap
             cons.iloc[i] = cons_raw.iloc[i] / gap
 
-    # Final safety net
-    cons = cons.clip(lower=0, upper=max_spike)
+    # Final safety net + fillna:
+    # - clip lower=0: usage tidak boleh negatif setelah preprocessing
+    # - fillna(0): unit yang tidak punya data hari tertentu → 0 (tidak putus di chart)
+    # - max_spike sudah tidak relevan (anomaly detection yang handle)
+    cons = cons.clip(lower=0).fillna(0)
 
     return pivot, cons, dedup_use, loc_map, df_ann, df_clean
 
@@ -2021,13 +2027,6 @@ with st.sidebar:
                 )
             )
 
-            max_spike = st.number_input(
-                "Max daily consumption limit (m³)",
-                min_value=10.0, max_value=50000.0,
-                value=5000.0, step=100.0,
-                help="Values above this threshold will be clipped (likely data errors)"
-            )
-
             st.markdown("---")
             st.markdown("### 📊 Display Charts")
             show_pie     = st.checkbox("Pie Chart — Distribution",      value=True)
@@ -2043,7 +2042,6 @@ with st.sidebar:
         raw_df         = pd.DataFrame()
         selected_prods = DEFAULT_PRODS
         dedup_method   = 'First'
-        max_spike      = 5000.0
         date_from      = None
         date_to        = None
         show_pie = show_bar = show_line = show_stacked = True
@@ -2100,7 +2098,7 @@ if not selected_prods:
     st.stop()
 
 with st.spinner("Processing data & detecting anomalies..."):
-    result = process_data(raw_df, selected_prods, dedup_method, max_spike,
+    result = process_data(raw_df, selected_prods, dedup_method,
                           preprocess_strategy)
 
 if not result:
@@ -2439,7 +2437,14 @@ with tab_raw:
     pivot_disp = pivot.copy()
     pivot_disp.index = [fmt_date(d) for d in pivot_disp.index]
     pivot_disp = pivot_disp[[p for p in selected_prods if p in pivot_disp.columns]]
-    st.dataframe(pivot_disp.round(1), use_container_width=True, height=400)
+    # Tampilkan consumption (daily diff) bukan raw indicator, dan None → 0
+    cons_disp_tbl = cons.copy()
+    cons_disp_tbl.index = [fmt_date(d) for d in cons_disp_tbl.index]
+    cons_disp_tbl = cons_disp_tbl[[p for p in selected_prods if p in cons_disp_tbl.columns]]
+    cons_disp_tbl = cons_disp_tbl.fillna(0).round(1)
+    # Add TOTAL column
+    cons_disp_tbl['TOTAL'] = cons_disp_tbl.sum(axis=1).round(1)
+    st.dataframe(cons_disp_tbl, use_container_width=True, height=400)
 
 
 
