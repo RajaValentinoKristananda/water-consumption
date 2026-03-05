@@ -143,8 +143,552 @@ def load_raw_data(file_bytes: bytes) -> pd.DataFrame:
     return df
 
 
+# ============================================================================
+# ANOMALY DETECTION & PREPROCESSING ENGINE  — PATCHED v2
+# ============================================================================
+#
+# ROOT CAUSE FIXES vs original:
+#
+#  BUG 1 — Stats contamination
+#    BEFORE: avg_normal/std_normal/IQR dihitung dari SEMUA pos_vals termasuk
+#            spike. Jika ada 1 hari spike 5000 m³, Q3 & std ikut naik sehingga
+#            outlier_upper bisa menjadi ribuan → spike tidak terdeteksi.
+#    FIX   : Two-pass robust stats (_robust_stats). Pass-1 buang nilai >
+#            GROSS_OUTLIER_MULT × rough_median. Pass-2 hitung Q1/Q3/IQR
+#            dari data bersih.
+#
+#  BUG 2 — outlier_upper dipilih dengan max() bukan min()
+#    BEFORE: outlier_upper = max(iqr_upper, p99_upper, avg_normal * 10)
+#            → selalu memilih batas PALING LONGGAR, spike lolos semua.
+#    FIX   : Gunakan clean IQR fence langsung tanpa max() antar kandidat.
+#
+#  BUG 3 — Tidak ada "physical plausibility" per hari
+#    BEFORE: Tidak ada deteksi berbasis konteks lokal (hari-hari sekitar).
+#    FIX   : _rolling_clean_median() → ekspektasi lokal tiap hari (rolling
+#            window 7 hari, outlier dibuang). Jika usage > PHYSICAL_MAX_MULT
+#            × ekspektasi lokal → SPIKE EKSTREM, tidak peduli z-score.
+#
+#  BUG 4 — Digit prefix detection tidak cek digit-magnitude
+#    BEFORE: Hanya coba strip prefix jika hasilnya match dalam tolerance.
+#    FIX   : Tambah cek: jika indikator punya jauh lebih banyak digit dari
+#            referensi, coba strip exact extra digits.
+# ============================================================================
+
+# Tuning knobs — ubah di sini jika perlu
+PHYSICAL_MAX_MULT   = 10   # usage > 10× ekspektasi lokal = tidak wajar secara fisik
+ROLLING_WINDOW_DAYS = 7    # hari tiap sisi untuk rolling clean median
+GROSS_OUTLIER_MULT  = 30   # pass-1 cap: buang nilai > 30× rough median sebelum hitung stats
+MIN_ABSOLUTE_SPIKE  = 50   # usage di bawah nilai ini TIDAK pernah dianggap spike,
+                           # tidak peduli berapa× ekspektasi lokal.
+                           # Mencegah unit intermittent (fin washing, dll) over-flagged
+                           # karena median-nya sangat kecil (misal 0.1 m³).
+                           # Aman untuk meter desimal: 50 m³/hari masih sangat besar
+                           # bahkan untuk meter yang biasanya baca 0.xx m³/hari.
+
+
+def _robust_stats(pos_arr: np.ndarray) -> tuple:
+    """
+    Hitung (clean_median, clean_std, iqr_upper) menggunakan two-pass outlier removal
+    sehingga spike tidak mengkontaminasi baseline stats.
+
+    Pass 1 — rough median, buang gross outlier (> GROSS_OUTLIER_MULT × rough_median)
+    Pass 2 — hitung Q1/Q3/IQR dan std dari data bersih
+    """
+    arr = pos_arr[~np.isnan(pos_arr)]
+    arr = arr[arr > 0]
+    if len(arr) == 0:
+        return 0.0, 1.0, float('inf')
+
+    # Pass 1: buang gross outlier
+    rough_med = float(np.median(arr))
+    if rough_med > 0:
+        clean = arr[arr <= rough_med * GROSS_OUTLIER_MULT]
+    else:
+        clean = arr
+    if len(clean) == 0:
+        clean = arr
+
+    # Pass 2: stats dari data bersih
+    clean_median = float(np.median(clean))
+    clean_std    = float(np.std(clean))
+    if clean_std == 0 or np.isnan(clean_std):
+        clean_std = max(clean_median * 0.1, 1.0)
+
+    if len(clean) >= 4:
+        Q1  = float(np.percentile(clean, 25))
+        Q3  = float(np.percentile(clean, 75))
+        IQR = Q3 - Q1
+        if IQR == 0:
+            iqr_upper = clean_median * 5
+        else:
+            iqr_upper = Q3 + 3 * IQR
+        # Minimal fence = 3× median (jangan over-flag unit yang stabil)
+        iqr_upper = max(iqr_upper, clean_median * 3)
+    else:
+        iqr_upper = clean_median * 5 if clean_median > 0 else float('inf')
+
+    return clean_median, clean_std, iqr_upper
+
+
+def _rolling_clean_median(usage_arr: np.ndarray,
+                           window: int = ROLLING_WINDOW_DAYS) -> np.ndarray:
+    """
+    Hitung rolling median harian dari usage, dengan mengabaikan gross outlier
+    di dalam window. Hasilnya adalah "ekspektasi fisik lokal" tiap hari yang
+    tidak terpengaruh spike di hari sekitarnya.
+    """
+    pos_vals = usage_arr[usage_arr > 0]
+    rough_med = float(np.nanmedian(pos_vals)) if len(pos_vals) > 0 else 1.0
+    spike_cap = rough_med * GROSS_OUTLIER_MULT
+
+    result = np.full(len(usage_arr), rough_med)
+    for i in range(len(usage_arr)):
+        start  = max(0, i - window)
+        end    = min(len(usage_arr), i + window + 1)
+        w_vals = usage_arr[start:end]
+        clean  = w_vals[(w_vals > 0) & (w_vals <= spike_cap)]
+        if len(clean) >= 2:
+            result[i] = float(np.median(clean))
+        elif rough_med > 0:
+            result[i] = rough_med
+        # Mencegah physical_cap = 10 × 0.1 = 1 m³ pada unit intermittent
+    return result
+
+
+def _try_strip_prefix(indicator_val: float, reference_val: float,
+                      tolerance: float = 0.10) -> tuple:
+    """
+    Coba strip 1–4 digit terdepan dari indicator_val.
+    Returns (corrected_value, n_digits_stripped) jika cocok dalam tolerance,
+    (None, 0) jika tidak.
+    Contoh: 203492 → 3492, 103484 → 3484, 1003492 → 3492
+    """
+    if reference_val <= 0 or pd.isna(indicator_val) or pd.isna(reference_val):
+        return None, 0
+    s = str(int(round(abs(indicator_val))))
+    for n in range(1, min(5, len(s))):
+        candidate = int(s[n:])
+        if candidate <= 0:
+            continue
+        if abs(candidate - reference_val) / max(reference_val, 1) <= tolerance:
+            return float(candidate), n
+    return None, 0
+
+
+def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    PATCHED v2 — Contamination-resistant anomaly detection.
+
+    Pipeline per pompa:
+      1. Two-pass robust stats (immune dari kontaminasi spike)
+      2. Rolling clean median sebagai ekspektasi fisik lokal per hari
+      3. PHYSICAL CAP: usage > PHYSICAL_MAX_MULT × ekspektasi lokal → SPIKE EKSTREM
+         (menangkap 5031 m³/hari ketika normal 30 m³/hari, tidak peduli z-score)
+      4. IQR fence dari clean stats (bukan max antar kandidat)
+      5. Digit-prefix detection + digit-magnitude check
+      6. Semua klasifikasi lain (negatif, meter reset, dll.) tetap sama
+    """
+    df = df.copy().sort_values(['Pompa', 'Date']).reset_index(drop=True)
+    df['usage_raw'] = df.groupby('Pompa')['Water_Indicator'].diff()
+
+    results = []
+    for pompa, grp in df.groupby('Pompa'):
+        grp   = grp.copy().sort_values('Date').reset_index(drop=True)
+        ind   = grp['Water_Indicator'].values
+        usage = grp['usage_raw'].copy()
+        u     = usage.values
+
+        # ── Robust baseline stats (two-pass, spike-immune) ────────────────
+        all_u_arr = np.array([float(v) if not pd.isna(v) else np.nan for v in u])
+        pos_arr   = all_u_arr[all_u_arr > 0]
+        pos_arr   = pos_arr[~np.isnan(pos_arr)]
+
+        clean_median, clean_std, iqr_upper = _robust_stats(pos_arr)
+
+        # ── Per-day physical expectation (rolling clean median) ───────────
+        all_u_safe     = np.where(np.isnan(all_u_arr), 0.0, all_u_arr)
+        local_expected = _rolling_clean_median(all_u_safe)
+        physical_cap   = local_expected * PHYSICAL_MAX_MULT   # per-day hard cap
+
+        grp['avg_normal']    = round(clean_median, 1)
+        grp['std_normal']    = round(clean_std, 1)
+        grp['outlier_upper'] = round(iqr_upper, 1)
+        grp['z_score']       = ((usage - clean_median) / clean_std).round(1)
+        grp['faktor_kali']   = np.where(
+            (usage > 0) & (clean_median > 0),
+            (usage / clean_median).round(1), np.nan
+        )
+
+        anomaly_type      = ['NORMAL'] * len(grp)
+        anomaly_reason    = [''] * len(grp)
+        digit_prefix_flag = [False] * len(grp)
+        corrected_ind     = [None] * len(grp)
+
+        z = grp['z_score'].values
+
+        # ── Pass 1: Digit-Prefix & Digit-Magnitude Detection ─────────────
+        clean_indicators = []
+        for i in range(len(grp)):
+            iv = float(ind[i]) if not pd.isna(ind[i]) else None
+
+            if len(clean_indicators) >= 2:
+                ref = float(np.median(clean_indicators[-5:]))
+
+                # A) Standard prefix strip
+                corrected, n_stripped = _try_strip_prefix(iv, ref) if iv is not None else (None, 0)
+
+                # B) Digit-magnitude check: indikator punya terlalu banyak digit vs ref
+                #    Contoh: ref=3492, iv=13492 → strip 1 digit depan
+                if corrected is None and iv is not None and ref > 0 and iv > 0:
+                    iv_digits  = len(str(int(abs(iv))))
+                    ref_digits = len(str(int(abs(ref))))
+                    if iv_digits > ref_digits + 1:
+                        extra_n   = iv_digits - ref_digits
+                        s_iv      = str(int(abs(iv)))
+                        candidate = int(s_iv[extra_n:]) if len(s_iv) > extra_n else 0
+                        if candidate > 0 and abs(candidate - ref) / max(ref, 1) <= 0.15:
+                            corrected  = float(candidate)
+                            n_stripped = extra_n
+
+                if corrected is not None and n_stripped >= 1:
+                    digit_prefix_flag[i] = True
+                    corrected_ind[i]     = corrected
+                    anomaly_type[i]      = 'DIGIT PREFIX ERROR'
+                    anomaly_reason[i]    = (
+                        f'Kamera Salah Baca — indikator {int(iv):,} '
+                        f'seharusnya {int(corrected):,} '
+                        f'({n_stripped} digit ekstra di depan)'
+                    )
+                    clean_indicators.append(corrected)
+                    continue
+
+            if iv is not None:
+                clean_indicators.append(float(iv))
+
+        # ── Pass 2: Usage-based Anomaly Classification ────────────────────
+        for i in range(len(grp)):
+            if digit_prefix_flag[i]:
+                continue
+
+            v       = float(u[i]) if not pd.isna(u[i]) else 0.0
+            zi      = float(z[i]) if not pd.isna(z[i]) else 0.0
+            phys_i  = float(physical_cap[i])
+            loc_exp = float(local_expected[i])
+            faktor  = round(v / loc_exp, 1) if loc_exp > 0 and v > 0 else 0
+
+            # ── PHYSICAL CAP (prioritas tertinggi untuk positif) ──────────
+            # Tangkap kasus seperti 5031 m³/hari ketika normal ~30 m³/hari.
+            # GUARD: jika usage secara absolut masih kecil (< MIN_ABSOLUTE_SPIKE),
+            # TIDAK flagging — unit intermittent seperti fin washing bisa punya
+            # median ~0.1 m³ sehingga 11 m³ terlihat "167× lokal" padahal wajar.
+            if v > 0 and v > phys_i and loc_exp > 0 and v >= MIN_ABSOLUTE_SPIKE:
+                anomaly_type[i]   = 'SPIKE EKSTREM'
+                anomaly_reason[i] = (
+                    f'Tidak Wajar Secara Fisik — usage {v:,.0f} m³/hari adalah '
+                    f'{faktor}× ekspektasi lokal {loc_exp:.1f} m³/hari '
+                    f'(batas fisik {phys_i:,.0f} m³). '
+                    f'Kemungkinan: kamera salah baca digit, tidak ada gambar, atau data corrupt.'
+                )
+                continue
+
+            # ── IQR Outlier (clean stats, bukan kontaminasi) ──────────────
+            # GUARD sama: jangan flag nilai kecil yang secara absolut masih wajar
+            if v > iqr_upper and iqr_upper < float('inf') and v >= MIN_ABSOLUTE_SPIKE:
+                faktor2 = round(v / clean_median, 1) if clean_median > 0 else 0
+                anomaly_type[i]   = 'SPIKE EKSTREM'
+                anomaly_reason[i] = (
+                    f'Outlier IQR (clean stats) — usage {v:,.0f} m³ melebihi batas wajar '
+                    f'{iqr_upper:,.0f} m³ ({faktor2}× median bersih {clean_median:.1f} m³/hari). '
+                    f'Kemungkinan: kamera salah baca, tidak ada gambar, atau data error.'
+                )
+                continue
+
+            # ── Pergantian Flowmeter via digit-count drop ─────────────────
+            if v < 0 and i > 0:
+                prev_ind   = float(ind[i-1]) if not pd.isna(ind[i-1]) else 0
+                curr_ind   = float(ind[i])   if not pd.isna(ind[i])   else 0
+                if prev_ind > 0 and curr_ind >= 0:
+                    prev_digits = len(str(int(abs(prev_ind))))
+                    curr_digits = len(str(int(abs(curr_ind)))) if curr_ind > 0 else 1
+                    digit_drop  = prev_digits - curr_digits
+                    next_inds   = [float(ind[j]) for j in range(i+1, min(i+4, len(grp)))
+                                   if not pd.isna(ind[j]) and float(ind[j]) > 0]
+                    next_small  = sum(1 for ni in next_inds
+                                      if len(str(int(ni))) <= curr_digits + 1)
+                    if digit_drop >= 2 and next_small >= 2:
+                        anomaly_type[i]   = 'PERGANTIAN FLOWMETER'
+                        anomaly_reason[i] = (
+                            f'Pergantian Flowmeter — indikator turun dari '
+                            f'{int(prev_ind):,} ({prev_digits} digit) ke '
+                            f'{int(curr_ind):,} ({curr_digits} digit), '
+                            f'hari berikutnya tetap kecil (meter baru mulai dari 0)'
+                        )
+                        continue
+
+            # Pergantian Flowmeter — large drop fallback
+            if v < -1000:
+                anomaly_type[i]   = 'PERGANTIAN FLOWMETER'
+                anomaly_reason[i] = 'Pergantian Flowmeter — indikator turun drastis (reset ke angka kecil)'
+
+            elif v < -100 and zi < -10:
+                anomaly_type[i]   = 'INPUT ERROR / METER RESET'
+                anomaly_reason[i] = 'Kemungkinan Kamera Terbalik atau Error Input Besar'
+
+            elif -500 <= v < -50 and zi < -1:
+                near_vals = [u[j] for j in range(max(0,i-5), min(len(u),i+5))
+                             if j != i and not pd.isna(u[j])]
+                similar   = sum(1 for nv in near_vals if abs(nv - v) < 20)
+                anomaly_type[i]   = 'NILAI NEGATIF'
+                anomaly_reason[i] = (
+                    'Kamera Membaca Nama Pompa — nilai negatif berulang'
+                    if similar >= 2 else
+                    'Kamera Gagal / Salah Membaca Flowmeter'
+                )
+
+            elif -50 <= v < 0:
+                anomaly_type[i]   = 'NILAI NEGATIF'
+                anomaly_reason[i] = 'Angka Flowmeter Rolling — digit transisi antar angka'
+
+            elif v > 0 and zi > 3 and i > 0 and (u[i-1] if not pd.isna(u[i-1]) else 0) < -50:
+                if v >= MIN_ABSOLUTE_SPIKE:
+                    anomaly_type[i]   = 'SPIKE'
+                    anomaly_reason[i] = 'Anomali Akibat Pembacaan Salah Sebelumnya'
+
+            # z-score spike: hanya flag jika nilai absolut juga besar
+            # Unit intermittent (median ~0.1 m³) akan punya z-score tinggi
+            # untuk nilai yang sebenarnya wajar (3-15 m³).
+            elif zi > 20 and v >= MIN_ABSOLUTE_SPIKE:
+                anomaly_type[i]   = 'SPIKE EKSTREM'
+                anomaly_reason[i] = 'Tidak Ada Gambar / Kamera Gagal Total — spike sangat ekstrem'
+
+            elif zi > 10 and v >= MIN_ABSOLUTE_SPIKE:
+                anomaly_type[i]   = 'SPIKE TINGGI'
+                anomaly_reason[i] = 'Kamera Gagal / Salah Membaca Flowmeter — nilai jauh di atas normal'
+
+            elif zi > 5 and v >= MIN_ABSOLUTE_SPIKE:
+                anomaly_type[i]   = 'SPIKE'
+                anomaly_reason[i] = 'Flowmeter Kotor / Kamera Kurang Akurat — perlu verifikasi'
+
+        grp['anomaly_type']       = anomaly_type
+        grp['anomaly_reason']     = anomaly_reason
+        grp['digit_prefix_error'] = digit_prefix_flag
+        grp['corrected_indicator']= corrected_ind
+        grp['is_anomaly']         = grp['anomaly_type'] != 'NORMAL'
+        results.append(grp)
+
+    return pd.concat(results, ignore_index=True)
+
+
+def _estimate_usage_for_spike(pos: int, indices: list, df: 'pd.DataFrame',
+                               avg_n: float, ou: float) -> float:
+    """
+    Estimasi usage wajar untuk hari spike dengan melihat konteks sekitarnya.
+
+    Strategi (prioritas):
+    1. Kalau hari SESUDAH bukan anomali dan usage-nya wajar → pakai usage itu
+       (spike hanya 1 hari, hari berikutnya normal → mirror usage hari sesudah)
+    2. Kalau ada beberapa hari normal di sekitar → rata-rata usage normal lokal
+    3. Fallback: avg_normal (baseline keseluruhan)
+
+    Ini mencegah hasil jadi 0 terus-menerus setelah spike.
+    """
+    # Kumpulkan usage normal dari window hari sekitar (±5 hari, bukan anomali)
+    local_usages = []
+    for offset in [-3, -2, -1, 1, 2, 3]:
+        nbr_pos = pos + offset
+        if 0 <= nbr_pos < len(indices):
+            nbr_idx = indices[nbr_pos]
+            nbr_anom = df.at[nbr_idx, 'is_anomaly']
+            nbr_raw  = df.at[nbr_idx, 'usage_raw']
+            if (not nbr_anom
+                    and nbr_raw is not None
+                    and not pd.isna(nbr_raw)
+                    and 0 < float(nbr_raw) <= (ou if ou < float('inf') else avg_n * 5)):
+                local_usages.append(float(nbr_raw))
+
+    # Prioritas 1: hari tepat sesudah normal & wajar (cermin paling akurat)
+    if pos + 1 < len(indices):
+        next_idx  = indices[pos + 1]
+        next_anom = df.at[next_idx, 'is_anomaly']
+        next_raw  = df.at[next_idx, 'usage_raw']
+        if (not next_anom
+                and next_raw is not None
+                and not pd.isna(next_raw)
+                and 0 < float(next_raw) <= (ou if ou < float('inf') else avg_n * 5)):
+            return float(next_raw)
+
+    # Prioritas 2: median dari hari normal lokal sekitar
+    if local_usages:
+        import numpy as _np
+        return float(_np.median(local_usages))
+
+    # Prioritas 3: fallback ke avg_normal
+    return avg_n if avg_n > 0 else 1.0
+
+
+def apply_preprocessing(df_annotated: pd.DataFrame,
+                        strategy: str = 'clip_to_zero') -> pd.DataFrame:
+    """
+    Apply preprocessing strategy. DATA NEVER DELETED.
+    Original value preserved in Water_Indicator_orig.
+
+    FINAL v5: Forward-pass chain recalculation + smart spike estimation.
+
+    Perbaikan vs v4:
+    - Spike TIDAK lagi di-set usage=cap_val yang bisa terlalu tinggi
+    - Spike di-estimasi berdasarkan konteks hari sekitar (hari sesudah jika normal)
+    - Ini mencegah grafik "flat/0" berkepanjangan setelah spike dikoreksi
+
+    Prinsip per tipe anomali:
+      DIGIT PREFIX ERROR    → gunakan corrected_indicator (strip digit)
+      PERGANTIAN FLOWMETER  → usage = 0 (hari transisi)
+      SPIKE EKSTREM/TINGGI  → usage = estimasi dari konteks lokal (bukan cap_val)
+      NILAI NEGATIF kecil   → usage = 0 (rolling digit transisi, wajar)
+      NILAI NEGATIF besar   → usage = 0 (kamera gagal)
+
+    Strategies:
+      flag_only      — mark only, no value changes
+      clip_to_zero   — koreksi berbasis forward-pass + estimasi konteks
+      interpolate    — indicator anomali diganti via time interpolation
+      rolling_median — indicator anomali diganti via 7-day rolling median
+    """
+    df = df_annotated.copy()
+    df['Water_Indicator_orig'] = df['Water_Indicator']
+    df['preprocessed']         = False
+
+    has_prefix  = 'digit_prefix_error' in df.columns
+    prefix_mask = df['digit_prefix_error'].fillna(False) if has_prefix else pd.Series(False, index=df.index)
+
+    if strategy == 'flag_only':
+        for idx in df[prefix_mask].index:
+            corr = df.at[idx, 'corrected_indicator']
+            if corr is not None and not pd.isna(corr):
+                df.at[idx, 'Water_Indicator'] = corr
+                df.at[idx, 'preprocessed']    = True
+        return df
+
+    # ── Per-pompa forward-pass ────────────────────────────────────────────
+    for pompa, grp in df.groupby('Pompa'):
+        grp_sorted = grp.sort_values('Date').copy()
+        indices    = grp_sorted.index.tolist()
+        idx_anom   = set(grp_sorted[grp_sorted['is_anomaly']].index)
+
+        avg_n = float(grp_sorted['avg_normal'].iloc[0]) if 'avg_normal' in grp_sorted.columns else 0
+        ou    = float(grp_sorted['outlier_upper'].iloc[0]) if 'outlier_upper' in grp_sorted.columns else float('inf')
+
+        # prev_corrected: indicator terkoreksi hari sebelumnya (satu-satunya state)
+        prev_corrected = None
+
+        for pos, idx in enumerate(indices):
+            atype  = df.at[idx, 'anomaly_type']
+            raw_v  = df.at[idx, 'usage_raw']
+            orig   = float(df.at[idx, 'Water_Indicator_orig'])
+
+            if prev_corrected is None:
+                prev_corrected = orig
+                continue
+
+            prev_orig  = float(df.at[indices[pos - 1], 'Water_Indicator_orig'])
+            orig_usage = orig - prev_orig
+
+            # ── Normal day ────────────────────────────────────────────────
+            if idx not in idx_anom:
+                new_ind = prev_corrected + orig_usage
+                if abs(new_ind - orig) > 0.01:
+                    df.at[idx, 'Water_Indicator'] = round(new_ind, 2)
+                    df.at[idx, 'preprocessed']    = True
+                prev_corrected = new_ind
+                continue
+
+            # ── Anomali ───────────────────────────────────────────────────
+
+            # DIGIT PREFIX ERROR
+            if atype == 'DIGIT PREFIX ERROR':
+                corr_ind = df.at[idx, 'corrected_indicator']
+                if corr_ind is not None and not pd.isna(corr_ind):
+                    usage_corr = max(0.0, float(corr_ind) - prev_orig)
+                    new_ind    = prev_corrected + usage_corr
+                    df.at[idx, 'Water_Indicator'] = round(new_ind, 2)
+                    df.at[idx, 'preprocessed']    = True
+                    prev_corrected = new_ind
+                # else: prev_corrected unchanged (usage=0)
+                continue
+
+            # PERGANTIAN FLOWMETER → transition day, usage = 0
+            elif atype == 'PERGANTIAN FLOWMETER':
+                df.at[idx, 'Water_Indicator'] = round(prev_corrected, 2)
+                df.at[idx, 'preprocessed']    = True
+                # prev_corrected unchanged
+
+            # SPIKE positif → estimasi usage dari konteks lokal
+            elif (raw_v is not None and not pd.isna(raw_v) and float(raw_v) > 0
+                  and atype in ('SPIKE EKSTREM', 'SPIKE TINGGI', 'SPIKE')):
+                est_usage = _estimate_usage_for_spike(pos, indices, df, avg_n, ou)
+                new_ind   = prev_corrected + est_usage
+                df.at[idx, 'Water_Indicator'] = round(new_ind, 2)
+                df.at[idx, 'preprocessed']    = True
+                prev_corrected = new_ind
+
+            # NILAI NEGATIF → usage = 0
+            elif raw_v is not None and not pd.isna(raw_v) and float(raw_v) < 0:
+                df.at[idx, 'Water_Indicator'] = round(prev_corrected, 2)
+                df.at[idx, 'preprocessed']    = True
+                # prev_corrected unchanged
+
+            else:
+                prev_corrected = orig
+
+        # ── Strategy interpolate / rolling_median ─────────────────────────
+        if strategy in ('interpolate', 'rolling_median'):
+            grp_updated = df.loc[indices].sort_values('Date')
+            s_orig      = grp_updated.set_index('Date')['Water_Indicator_orig'].copy().astype(float)
+            s_work      = s_orig.copy()
+
+            for idx in idx_anom:
+                dv = df.at[idx, 'Date']
+                s_work[dv] = np.nan
+
+            if strategy == 'interpolate':
+                try:
+                    s_filled = s_work.interpolate(method='time', limit_direction='both')
+                except Exception:
+                    s_filled = s_work.ffill().bfill()
+            else:   # rolling_median
+                s_filled = s_work.copy()
+                roll     = s_orig.rolling(window=7, min_periods=1, center=True).median()
+                for dv in s_work[s_work.isna()].index:
+                    s_filled[dv] = roll[dv]
+                s_filled = s_filled.ffill().bfill()
+
+            for idx in idx_anom:
+                dv = df.at[idx, 'Date']
+                if dv in s_filled.index:
+                    df.at[idx, 'Water_Indicator'] = round(float(s_filled[dv]), 2)
+                    df.at[idx, 'preprocessed']    = True
+
+    return df
+
+def get_anomaly_summary(df_annotated: pd.DataFrame) -> pd.DataFrame:
+    """Return a clean summary DataFrame of all detected anomalies."""
+    anom = df_annotated[df_annotated['is_anomaly']].copy()
+    if anom.empty:
+        return pd.DataFrame()
+    anom['usage_raw'] = anom['usage_raw'].round(2)
+    anom['z_score']   = anom['z_score'].round(1)
+    cols = ['Date', 'Pompa', 'Location', 'Water_Indicator', 'corrected_indicator',
+            'usage_raw', 'avg_normal', 'z_score',
+            'anomaly_type', 'anomaly_reason', 'digit_prefix_error', 'preprocessed']
+    cols = [c for c in cols if c in anom.columns]
+    return anom[cols].sort_values(['anomaly_type', 'z_score']).reset_index(drop=True)
+
+
+# ============================================================================
+# DATA PROCESSING (uses preprocessing pipeline)
+# ============================================================================
+
 def process_data(df: pd.DataFrame, selected_prods: list,
-                 dedup_method: str, max_spike: float):
+                 dedup_method: str, max_spike: float,
+                 preprocess_strategy: str = 'flag_only'):
     if df.empty or not selected_prods:
         return None
 
@@ -152,6 +696,7 @@ def process_data(df: pd.DataFrame, selected_prods: list,
     if filt.empty:
         return None
 
+    # ── Step 1: Dedup ──────────────────────────────────────────────────────
     if dedup_method == 'First':
         dedup = filt.groupby(['Date', 'Pompa'])['Water_Indicator'].first().reset_index()
     elif dedup_method == 'Last':
@@ -164,14 +709,34 @@ def process_data(df: pd.DataFrame, selected_prods: list,
     loc_map = filt.groupby('Pompa')['Location'].first().to_dict()
     dedup['Location'] = dedup['Pompa'].map(loc_map)
 
-    pivot = (dedup.pivot(index='Date', columns='Pompa', values='Water_Indicator')
-                  .sort_index())
+    # ── Step 2: Anomaly Detection ──────────────────────────────────────────
+    if preprocess_strategy != 'none':
+        df_ann   = detect_anomalies(dedup)
+        df_clean = apply_preprocessing(df_ann, strategy=preprocess_strategy)
+        dedup_use = df_clean[['Date', 'Pompa', 'Location', 'Water_Indicator']].copy()
+    else:
+        df_ann    = detect_anomalies(dedup)
+        df_clean  = df_ann.copy()
+        df_clean['preprocessed'] = False
+        dedup_use = dedup
+
+    # ── Step 3: Pivot & consumption diff from CLEAN indicators ────────────
+    # At this point Water_Indicator in dedup_use has been chain-corrected:
+    # - digit prefix errors → stripped to correct value
+    # - meter replacements  → chain shifted so diffs are valid
+    # - IQR spikes          → indicator capped at prev + outlier_upper
+    # - negative anomalies  → indicator set to prev (usage = 0)
+    # The diff() below should produce only clean non-negative values.
+    pivot = (dedup_use.pivot(index='Date', columns='Pompa', values='Water_Indicator')
+                       .sort_index())
 
     cons = pivot.diff()
     cons.iloc[0] = 0
+    # Final safety net: any remaining negatives → 0, any remaining spikes → cap
+    # (should be rare after preprocessing, but protects chart display)
     cons = cons.clip(lower=0, upper=max_spike)
 
-    return pivot, cons, dedup, loc_map
+    return pivot, cons, dedup_use, loc_map, df_ann, df_clean
 
 
 # ============================================================================
@@ -1411,6 +1976,21 @@ with st.sidebar:
                                       min_value=min_date)
 
             st.markdown("---")
+            st.markdown("### 🧹 Data Preprocessing")
+            preprocess_strategy = st.selectbox(
+                "Anomaly Handling Strategy",
+                ['flag_only', 'clip_to_zero', 'interpolate', 'rolling_median'],
+                index=1,
+                format_func=lambda x: {
+                    'flag_only':      '🔍 Flag Only — no changes, mark anomalies',
+                    'clip_to_zero':   '✂️ Clip to Zero — set bad days to prev indicator',
+                    'interpolate':    '📈 Interpolate — fill anomalies with time interpolation',
+                    'rolling_median': '📊 Rolling Median — replace with 7-day median',
+                }[x],
+                help="Data asli TIDAK pernah dihapus. Nilai original tersimpan di kolom Water_Indicator_orig."
+            )
+
+            st.markdown("---")
             st.markdown("### 🔧 Calculation Options")
 
             dedup_method = st.selectbox(
@@ -1450,6 +2030,7 @@ with st.sidebar:
         date_to        = None
         show_pie = show_bar = show_line = show_stacked = True
         show_heatmap = show_cumul = show_box = True
+        preprocess_strategy = 'clip_to_zero'
 
     st.markdown("---")
     st.markdown(
@@ -1500,14 +2081,15 @@ if not selected_prods:
     st.warning("⚠️ Please select at least one unit from the sidebar.")
     st.stop()
 
-with st.spinner("Processing data..."):
-    result = process_data(raw_df, selected_prods, dedup_method, max_spike)
+with st.spinner("Processing data & detecting anomalies..."):
+    result = process_data(raw_df, selected_prods, dedup_method, max_spike,
+                          preprocess_strategy)
 
 if not result:
     st.error("Failed to process data. Please check the file and your unit selection.")
     st.stop()
 
-pivot, cons, dedup_df, loc_map = result
+pivot, cons, dedup_df, loc_map, df_annotated, df_clean = result
 
 cons_active = cons.iloc[1:]
 cons_totals = cons_active.sum()
@@ -1532,8 +2114,8 @@ st.markdown(
 # ============================================================================
 # TABS
 # ============================================================================
-tab_ov, tab_daily, tab_table, tab_raw = st.tabs([
-    "📊 Overview", "📈 Daily Analysis", "📋 Data Table", "🗃️ Raw Data"
+tab_ov, tab_daily, tab_table, tab_raw, tab_anom = st.tabs([
+    "📊 Overview", "📈 Daily Analysis", "📋 Data Table", "🗃️ Raw Data", "🚨 Anomaly Report"
 ])
 
 
@@ -1842,9 +2424,190 @@ with tab_raw:
     st.dataframe(pivot_disp.round(1), use_container_width=True, height=400)
 
 
-# ============================================================================
-# FOOTER
-# ============================================================================
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 5 – ANOMALY REPORT
+# ─────────────────────────────────────────────────────────────────────────────
+with tab_anom:
+    anom_summary = get_anomaly_summary(df_annotated)
+    n_anom       = len(anom_summary)
+    n_total      = len(df_annotated)
+    n_preprocessed = int(df_clean['preprocessed'].sum()) if 'preprocessed' in df_clean.columns else 0
+
+    # ── KPI row ──────────────────────────────────────────────────────────────
+    ka, kb, kc, kd = st.columns(4)
+    ka.metric("Total Records",      f"{n_total:,}")
+    kb.metric("Anomalies Detected", f"{n_anom:,}",
+              delta=f"{n_anom/n_total*100:.1f}%" if n_total else None,
+              delta_color="inverse")
+    kc.metric("Records Corrected",  f"{n_preprocessed:,}",
+              help="Rows where Water_Indicator was adjusted by preprocessing")
+    kd.metric("Strategy Applied",   preprocess_strategy.replace('_', ' ').title())
+
+    if n_anom == 0:
+        st.success("✅ No anomalies detected in selected date range and units.")
+    else:
+        st.markdown("---")
+
+        # ── Anomaly type breakdown chart ──────────────────────────────────────
+        col_chart, col_pie = st.columns([3, 2])
+        with col_chart:
+            st.markdown("#### Anomaly Count by Type")
+            type_counts = (anom_summary['anomaly_type']
+                           .value_counts().reset_index()
+                           .rename(columns={'index': 'type', 'anomaly_type': 'count',
+                                            'count': 'count'}))
+            type_counts.columns = ['Type', 'Count']
+            color_map = {
+                'SPIKE EKSTREM':             '#ef4444',
+                'SPIKE TINGGI':              '#f97316',
+                'SPIKE':                     '#f59e0b',
+                'INPUT ERROR / METER RESET': '#8b5cf6',
+                'NILAI NEGATIF':             '#06b6d4',
+                'DIGIT PREFIX ERROR':        '#e11d48',
+                'PERGANTIAN FLOWMETER':      '#7c3aed',
+            }
+            fig_bar_a = go.Figure(go.Bar(
+                x=type_counts['Count'], y=type_counts['Type'],
+                orientation='h',
+                marker_color=[color_map.get(t, '#94a3b8') for t in type_counts['Type']],
+                text=type_counts['Count'], textposition='outside'
+            ))
+            fig_bar_a.update_layout(
+                height=280, margin=dict(l=0, r=40, t=10, b=10),
+                xaxis_title='Count', yaxis_title='',
+                plot_bgcolor='white', paper_bgcolor='white',
+            )
+            st.plotly_chart(fig_bar_a, use_container_width=True)
+
+        with col_pie:
+            st.markdown("#### Anomaly Reason Breakdown")
+            reason_counts = anom_summary['anomaly_reason'].value_counts().head(8)
+            # Shorten labels
+            short_reasons = [r[:40] + '…' if len(r) > 40 else r for r in reason_counts.index]
+            fig_pie_a = go.Figure(go.Pie(
+                labels=short_reasons, values=reason_counts.values,
+                hole=0.4, textinfo='percent',
+                hovertext=reason_counts.index,
+            ))
+            fig_pie_a.update_layout(
+                height=280, margin=dict(l=0, r=0, t=10, b=10),
+                showlegend=True, legend=dict(font_size=9),
+                paper_bgcolor='white',
+            )
+            st.plotly_chart(fig_pie_a, use_container_width=True)
+
+        # ── Anomalies over time ───────────────────────────────────────────────
+        st.markdown("#### Anomalies Over Time")
+        anom_by_date = (anom_summary.groupby(['Date', 'anomaly_type'])
+                        .size().reset_index(name='count'))
+        fig_time = go.Figure()
+        for atype, color in color_map.items():
+            d = anom_by_date[anom_by_date['anomaly_type'] == atype]
+            if not d.empty:
+                fig_time.add_trace(go.Bar(
+                    x=d['Date'], y=d['count'],
+                    name=atype, marker_color=color
+                ))
+        fig_time.update_layout(
+            barmode='stack', height=240,
+            margin=dict(l=0, r=0, t=10, b=10),
+            xaxis_title='Date', yaxis_title='Count',
+            plot_bgcolor='white', paper_bgcolor='white',
+            legend=dict(orientation='h', y=-0.3, font_size=10),
+        )
+        st.plotly_chart(fig_time, use_container_width=True)
+
+        # ── Per-pompa anomaly table ───────────────────────────────────────────
+        st.markdown("#### Anomalies per Unit (Pompa)")
+        per_pompa = (anom_summary.groupby('Pompa')
+                     .agg(
+                         Total_Anomalies=('anomaly_type', 'count'),
+                         Spike_Count=('anomaly_type', lambda x: (x.str.contains('SPIKE')).sum()),
+                         Negative_Count=('anomaly_type', lambda x: (x == 'NILAI NEGATIF').sum()),
+                         Reset_Count=('anomaly_type', lambda x: (x == 'INPUT ERROR / METER RESET').sum()),
+                         Worst_Z=('z_score', lambda x: x.abs().max()),
+                     ).reset_index().sort_values('Total_Anomalies', ascending=False))
+        per_pompa['Worst_Z'] = per_pompa['Worst_Z'].round(1)
+        per_pompa['Status'] = per_pompa['Total_Anomalies'].apply(
+            lambda x: '🔴 PERLU AUDIT' if x >= 10 else ('🟡 PERLU CEK' if x >= 3 else '🟢 OK')
+        )
+        st.dataframe(per_pompa, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+        # ── Detailed anomaly table ────────────────────────────────────────────
+        st.markdown("#### Detailed Anomaly List")
+
+        # Filters
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            filter_type = st.multiselect(
+                "Filter by Anomaly Type",
+                options=anom_summary['anomaly_type'].unique().tolist(),
+                default=anom_summary['anomaly_type'].unique().tolist()
+            )
+        with fc2:
+            filter_pompa = st.multiselect(
+                "Filter by Unit (Pompa)",
+                options=anom_summary['Pompa'].unique().tolist(),
+                default=anom_summary['Pompa'].unique().tolist()
+            )
+        with fc3:
+            year_options = sorted(anom_summary['Date'].dt.year.unique().tolist())
+            filter_year  = st.multiselect("Filter by Year", options=year_options,
+                                           default=year_options)
+
+        disp = anom_summary[
+            (anom_summary['anomaly_type'].isin(filter_type)) &
+            (anom_summary['Pompa'].isin(filter_pompa)) &
+            (anom_summary['Date'].dt.year.isin(filter_year))
+        ].copy()
+        disp['Date'] = disp['Date'].dt.strftime('%d-%b-%Y')
+
+        st.dataframe(disp, use_container_width=True, height=400, hide_index=True)
+
+        # Download anomaly report CSV
+        csv_anom = anom_summary.copy()
+        csv_anom['Date'] = csv_anom['Date'].dt.strftime('%Y-%m-%d')
+        st.download_button(
+            "⬇️ Download Anomaly Report (CSV)",
+            csv_anom.to_csv(index=False).encode('utf-8'),
+            'anomaly_report.csv', 'text/csv'
+        )
+
+        # ── Strategy explanation ──────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### ℹ️ Preprocessing Strategy Explanation")
+        strategy_info = {
+            'flag_only': (
+                "**🔍 Flag Only** — Semua anomali ditandai tapi **tidak ada nilai yang diubah**. "
+                "Data visualisasi menggunakan nilai asli. Cocok untuk audit manual."
+            ),
+            'clip_to_zero': (
+                "**✂️ Clip to Zero** — Untuk hari yang anomali negatif, indikator diganti dengan "
+                "nilai hari sebelumnya sehingga usage = 0 (tidak ada konsumsi negatif). "
+                "Data asli tetap tersimpan di kolom `Water_Indicator_orig`."
+            ),
+            'interpolate': (
+                "**📈 Interpolate** — Nilai indikator pada hari anomali digantikan dengan "
+                "interpolasi linear berdasarkan waktu (titik sebelum dan sesudah). "
+                "Data asli tetap tersimpan di kolom `Water_Indicator_orig`."
+            ),
+            'rolling_median': (
+                "**📊 Rolling Median** — Nilai indikator pada hari anomali digantikan dengan "
+                "median 7 hari rolling window di sekitar tanggal tersebut. "
+                "Data asli tetap tersimpan di kolom `Water_Indicator_orig`."
+            ),
+        }
+        st.info(strategy_info.get(preprocess_strategy, ''))
+        st.markdown(
+            "> ⚠️ **Integritas Data:** Nilai asli **TIDAK PERNAH dihapus**. "
+            "Semua perubahan bersifat computed — file upload Anda tidak berubah. "
+            "Kolom `Water_Indicator_orig` selalu menyimpan nilai asli untuk auditability."
+        )
+
+
 st.markdown("---")
 st.markdown("""
 <div style='text-align:center;color:#94a3b8;padding:1.5rem;
