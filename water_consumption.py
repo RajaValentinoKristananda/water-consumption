@@ -63,6 +63,72 @@ st.markdown("""
 DEFAULT_PRODS = ['PROD 1.3', 'PROD 1.4', 'PROD 1.5', 'PROD 1.6',
                  'PROD 2.5', 'PROD 2.6', 'PROD 2.7']
 
+# ============================================================================
+# SMART ANALYSIS — CONSTANTS & HELPER FUNCTIONS
+# ============================================================================
+PROD_UNITS  = ['PROD 1.3', 'PROD 1.4', 'PROD 1.5', 'PROD 1.6',
+               'PROD 2.5', 'PROD 2.6', 'PROD 2.7']
+DOM_UNITS   = ['DOM 1.1', 'DOM 1.2', 'DOM 2.1', 'DOM 2.2', 'DOM 2.3', 'DOM 2.4']
+SIPA_P1     = ['SIPA 1', 'SIPA 2']
+MONTH_ORDER = ['Dec', 'Jan', 'Feb', 'Mar', 'Apr', 'May',
+               'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov']
+
+
+def get_fiscal_year(dt):
+    """Dec belongs to next FY. Dec 2024 → FY 2025."""
+    if pd.isnull(dt):
+        return None
+    return dt.year + 1 if dt.month == 12 else dt.year
+
+
+def build_monthly_fy(cons_df: pd.DataFrame, units: list) -> pd.DataFrame:
+    """Daily consumption → monthly totals grouped by FY and calendar month."""
+    avail = [u for u in units if u in cons_df.columns]
+    if not avail:
+        return pd.DataFrame()
+    tmp = cons_df[avail].copy()
+    tmp.index = pd.to_datetime(tmp.index)
+    tmp['FY']    = tmp.index.map(get_fiscal_year)
+    tmp['Month'] = tmp.index.strftime('%b')
+    grp = tmp.groupby(['FY', 'Month'])[avail].sum().reset_index()
+    grp['Total'] = grp[avail].sum(axis=1)
+    mo_idx = {m: i for i, m in enumerate(MONTH_ORDER)}
+    grp['_mo'] = grp['Month'].map(mo_idx)
+    return grp.sort_values(['FY', '_mo']).drop(columns='_mo').reset_index(drop=True)
+
+
+def build_fy_summary(monthly_df: pd.DataFrame, avail: list) -> pd.DataFrame:
+    """Monthly FY data → one row per FY with each month as column + YTD total."""
+    if monthly_df.empty:
+        return pd.DataFrame()
+    rows = []
+    for fy, grp in monthly_df.groupby('FY'):
+        row = {'FY': fy}
+        for m in MONTH_ORDER:
+            mrow = grp[grp['Month'] == m]
+            row[m] = round(float(mrow['Total'].values[0]), 0) if len(mrow) else 0
+        row['YTD'] = round(grp['Total'].sum(), 0)
+        for u in avail:
+            row[u] = round(grp[u].sum(), 0) if u in grp.columns else 0
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def load_water_bill(file_bytes: bytes) -> pd.DataFrame:
+    """Load water bill Excel → DataFrame [Date, Month, FY, Volume_m3, Amount_Rp]."""
+    buf = io.BytesIO(file_bytes)
+    df  = pd.read_excel(buf, header=3)
+    df.columns = ['Date', 'Volume_m3', 'Amount_Rp'] + list(df.columns[3:])
+    df = df[['Date', 'Volume_m3', 'Amount_Rp']].dropna(subset=['Date', 'Volume_m3'])
+    df['Date']      = pd.to_datetime(df['Date'], errors='coerce')
+    df['Volume_m3'] = pd.to_numeric(df['Volume_m3'], errors='coerce').fillna(0)
+    df['Amount_Rp'] = pd.to_numeric(df['Amount_Rp'], errors='coerce').fillna(0)
+    df = df.dropna(subset=['Date'])
+    df['Month'] = df['Date'].dt.strftime('%b')
+    df['FY']    = df['Date'].apply(get_fiscal_year)
+    return df
+
+
 _COLOR_PALETTE = [
     '#0ea5e9', '#10b981', '#f59e0b', '#ef4444',
     '#8b5cf6', '#ec4899', '#06b6d4', '#f97316',
@@ -1978,7 +2044,11 @@ with st.sidebar:
 
         if not raw_df.empty:
             available_prods = sorted(raw_df['Pompa'].unique().tolist())
-            default_sel     = [p for p in DEFAULT_PRODS if p in available_prods]
+            # Default: PROD units. Smart Analysis butuh PROD+DOM+SIPA — include semua yg ada
+            smart_units = PROD_UNITS + DOM_UNITS + SIPA_P1
+            default_sel = [p for p in smart_units if p in available_prods]
+            if not default_sel:
+                default_sel = [p for p in DEFAULT_PRODS if p in available_prods]
             if not default_sel:
                 default_sel = available_prods[:min(7, len(available_prods))]
 
@@ -1986,7 +2056,7 @@ with st.sidebar:
                 "Select Units",
                 options=available_prods,
                 default=default_sel,
-                help="Select one or more units to analyse"
+                help="Select one or more units to analyse. Smart Analysis membutuhkan unit PROD, DOM, dan SIPA."
             )
 
             st.markdown("---")
@@ -2036,8 +2106,19 @@ with st.sidebar:
             show_heatmap = st.checkbox("Heatmap",                        value=True)
             show_cumul   = st.checkbox("Cumulative Consumption",         value=True)
             show_box     = st.checkbox("Avg & Max Bar Chart",            value=True)
+
+            # ── Smart Analysis sidebar ───────────────────────────────────────
+            st.markdown("---")
+            st.markdown("### 💡 Smart Analysis")
+            wb_file = st.file_uploader(
+                "Upload Water Bill (*.xlsx)", type=['xlsx'],
+                key='waterbill_upload',
+                help="File tagihan air bulanan (kolom: Month, Volume m³, Amount Rp)"
+            )
         else:
             selected_prods = []
+            wb_file     = None
+            selected_fy = 'All FY'
     else:
         raw_df         = pd.DataFrame()
         selected_prods = DEFAULT_PRODS
@@ -2047,6 +2128,8 @@ with st.sidebar:
         show_pie = show_bar = show_line = show_stacked = True
         show_heatmap = show_cumul = show_box = True
         preprocess_strategy = 'clip_to_zero'
+        wb_file     = None
+        selected_fy = 'All FY'
 
     st.markdown("---")
     st.markdown(
@@ -2130,8 +2213,9 @@ st.markdown(
 # ============================================================================
 # TABS
 # ============================================================================
-tab_ov, tab_daily, tab_table, tab_raw, tab_anom = st.tabs([
-    "📊 Overview", "📈 Daily Analysis", "📋 Data Table", "🗃️ Raw Data", "🚨 Anomaly Report"
+tab_ov, tab_daily, tab_table, tab_raw, tab_anom, tab_smart = st.tabs([
+    "📊 Overview", "📈 Daily Analysis", "📋 Data Table",
+    "🗃️ Raw Data", "🚨 Anomaly Report", "💡 Smart Analysis"
 ])
 
 
@@ -2628,6 +2712,651 @@ with tab_anom:
             "> ⚠️ **Integritas Data:** Nilai asli **TIDAK PERNAH dihapus**. "
             "Semua perubahan bersifat computed — file upload Anda tidak berubah. "
             "Kolom `Water_Indicator_orig` selalu menyimpan nilai asli untuk auditability."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 6 – SMART ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+with tab_smart:
+
+    # Header banner
+    st.markdown("""
+    <div style="background:linear-gradient(135deg,#0c4a6e,#0284c7);border-radius:14px;
+                padding:20px 28px;margin-bottom:20px;color:white;">
+      <div style="font-size:22px;font-weight:800;margin-bottom:4px;">
+        💡 Smart Analysis — Water Usage Report</div>
+      <div style="font-size:13px;opacity:0.85;">
+        Laporan Fiscal Year (Des–Nov) · Production · Domestic · Water Balance · Water Bill
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── FY selector (top-right, sebelum data prep) ───────────────────────────
+    if not raw_df.empty:
+        _fy_all = sorted(set(
+            get_fiscal_year(d) for d in pd.to_datetime(raw_df['Date'])
+            if get_fiscal_year(d) is not None
+        ))
+        _fy_opts_top = ['All FY'] + [f'FY {int(y)}' for y in _fy_all]
+    else:
+        _fy_all      = []
+        _fy_opts_top = ['All FY']
+
+    _col_spacer, _col_fy_top = st.columns([3, 1])
+    with _col_fy_top:
+        selected_fy = st.selectbox(
+            "Fiscal Year",
+            options=_fy_opts_top,
+            index=len(_fy_opts_top) - 1,
+            key='sa_fy_inline',
+            label_visibility='collapsed'
+        )
+
+    # Load water bill if uploaded
+    wb_df = None
+    if wb_file is not None:
+        try:
+            wb_df = load_water_bill(wb_file.read())
+            st.success(
+                f"✅ Water Bill loaded: {len(wb_df)} bulan "
+                f"({wb_df['Date'].min().strftime('%b %Y')} – "
+                f"{wb_df['Date'].max().strftime('%b %Y')})"
+            )
+        except Exception as e:
+            st.error(f"Gagal load water bill: {e}")
+
+    # ── Prepare data ──────────────────────────────────────────────────────────
+    cons_work = cons_active.copy()
+    cons_work.index = pd.to_datetime(cons_work.index)
+    cons_work['FY']    = cons_work.index.map(get_fiscal_year)
+    cons_work['Month'] = cons_work.index.strftime('%b')
+
+    prod_avail  = [u for u in PROD_UNITS if u in cons_work.columns]
+    dom_avail   = [u for u in DOM_UNITS  if u in cons_work.columns]
+    sipa1_avail = [u for u in SIPA_P1    if u in cons_work.columns]
+
+    cons_base     = cons_work.drop(columns=['FY', 'Month'], errors='ignore')
+    monthly_prod  = build_monthly_fy(cons_base, prod_avail)
+    monthly_dom   = build_monthly_fy(cons_base, dom_avail)
+    monthly_sipa1 = build_monthly_fy(cons_base, sipa1_avail)
+
+    # ── Totals (FY-filtered) ──────────────────────────────────────────────────
+    def sum_units_sa(units):
+        avail = [u for u in units if u in cons_work.columns]
+        if not avail:
+            return 0.0
+        if selected_fy != 'All FY':
+            fy_num = int(selected_fy.replace('FY ', ''))
+            sub = cons_work[cons_work['FY'] == fy_num][avail]
+        else:
+            sub = cons_work[avail]
+        return float(sub.sum().sum())
+
+    total_prod  = sum_units_sa(PROD_UNITS)
+    total_dom   = sum_units_sa(DOM_UNITS)
+    total_sipa1 = sum_units_sa(SIPA_P1)
+    total_dist  = total_prod + total_dom
+    gap_m3      = total_sipa1 - total_dist
+    gap_pct     = (gap_m3 / total_sipa1 * 100) if total_sipa1 > 0 else 0
+
+    wb_total = 0.0
+    if wb_df is not None:
+        wb_sub   = wb_df if selected_fy == 'All FY' else                    wb_df[wb_df['FY'] == int(selected_fy.replace('FY ', ''))]
+        wb_total = float(wb_sub['Volume_m3'].sum())
+    sipa_bill_gap = total_sipa1 - wb_total if wb_total > 0 else None
+
+    # ── Warning if key units missing ─────────────────────────────────────────
+    missing = []
+    if not prod_avail:  missing.append("PROD (PROD 1.3–PROD 2.7)")
+    if not dom_avail:   missing.append("DOM (DOM 1.1–DOM 2.4)")
+    if not sipa1_avail: missing.append("SIPA (SIPA 1, SIPA 2)")
+    if missing:
+        st.warning(
+            f"⚠️ Unit belum dipilih di sidebar: **{', '.join(missing)}**. "
+            f"Pilih unit-unit tersebut untuk tampilan lengkap."
+        )
+
+    # ── KPI Cards ─────────────────────────────────────────────────────────────
+    def sa_card(label, value, sub, color, icon):
+        return (
+            f"<div style='background:white;border-radius:12px;padding:16px 18px;"
+            f"box-shadow:0 1px 6px rgba(0,0,0,0.07);border-top:4px solid {color};"
+            f"text-align:center;font-family:Inter,sans-serif;'>"
+            f"<div style='font-size:11px;font-weight:700;color:{color};letter-spacing:.8px;"
+            f"text-transform:uppercase;margin-bottom:6px;'>{icon} {label}</div>"
+            f"<div style='font-size:26px;font-weight:800;color:#0f172a;line-height:1.1;'>{value}</div>"
+            f"<div style='font-size:12px;color:#94a3b8;margin-top:4px;'>{sub}</div>"
+            f"</div>"
+        )
+
+    gap_color = "#10b981" if gap_m3 >= 0 else "#ef4444"
+    gap_icon  = "✅" if gap_m3 >= 0 else "⚠️"
+    bill_val  = f"{wb_total:,.0f} m³" if wb_total > 0 else "— upload bill"
+    bill_sub  = (f"Gap vs SIPA: {sipa_bill_gap:+,.0f} m³"
+                 if sipa_bill_gap is not None else "Upload Water Bill")
+    bill_clr  = ("#ef4444" if sipa_bill_gap is not None and abs(sipa_bill_gap) > 500
+                 else "#64748b")
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.markdown(sa_card("SIPA Intake", f"{total_sipa1:,.0f} m³", "Air masuk sumur",  "#0ea5e9", "💧"), unsafe_allow_html=True)
+    c2.markdown(sa_card("Production",  f"{total_prod:,.0f} m³",  "Distribusi PROD",  "#10b981", "🏭"), unsafe_allow_html=True)
+    c3.markdown(sa_card("Domestic",    f"{total_dom:,.0f} m³",   "Distribusi DOM",   "#f59e0b", "🏠"), unsafe_allow_html=True)
+    c4.markdown(sa_card("Total Dist",  f"{total_dist:,.0f} m³",  "PROD + DOM",       "#8b5cf6", "📤"), unsafe_allow_html=True)
+    c5.markdown(sa_card("Balance",     f"{gap_m3:+,.0f} m³",     f"{gap_pct:+.1f}% dari SIPA", gap_color, gap_icon), unsafe_allow_html=True)
+    c6.markdown(sa_card("Water Bill",  bill_val,                  bill_sub,           bill_clr,  "💰"), unsafe_allow_html=True)
+
+    st.markdown(
+        "<div style='font-size:12px;color:#64748b;background:#f8fafc;border-radius:8px;"
+        "padding:8px 14px;margin-top:8px;display:inline-block;'>"
+        "⚖️ <b>Balance = SIPA – (PROD+DOM)</b> &nbsp;·&nbsp; "
+        "🟢 Positif = losses wajar &nbsp;·&nbsp; "
+        "🔴 Negatif = distribusi &gt; intake (investigasi!) &nbsp;·&nbsp; "
+        "💰 Water Bill ≈ SIPA jika meter selaras</div>",
+        unsafe_allow_html=True
+    )
+
+    # ── Hierarchical Report Table ────────────────────────────────────────────
+    st.markdown("---")
+
+    all_fy_nums = sorted(set(
+        list(monthly_prod['FY'].unique()  if not monthly_prod.empty  else []) +
+        list(monthly_sipa1['FY'].unique() if not monthly_sipa1.empty else []) +
+        list(monthly_dom['FY'].unique()   if not monthly_dom.empty   else [])
+    ))
+
+    def get_mo_totals(mdf, fy_v):
+        if mdf.empty: return {}
+        g = mdf[mdf['FY'] == fy_v]
+        return {r['Month']: round(float(r['Total']), 0) for _, r in g.iterrows()}
+
+    def get_mo_unit(cons_df, unit, fy_v):
+        """Monthly values for a single unit in a given FY."""
+        if unit not in cons_df.columns: return {}
+        tmp = cons_df[[unit]].copy()
+        tmp.index = pd.to_datetime(tmp.index)
+        tmp['FY']    = tmp.index.map(get_fiscal_year)
+        tmp['Month'] = tmp.index.strftime('%b')
+        sub = tmp[tmp['FY'] == fy_v]
+        grp = sub.groupby('Month')[unit].sum()
+        return {m: round(float(grp[m]), 0) for m in grp.index if grp[m] > 0}
+
+    combined_rows_sa = []
+    for fy_v in all_fy_nums:
+        prod_mo = get_mo_totals(monthly_prod,  fy_v)
+        dom_mo  = get_mo_totals(monthly_dom,   fy_v)
+        sipa_mo = get_mo_totals(monthly_sipa1, fy_v)
+        yp = sum(prod_mo.values())
+        yd = sum(dom_mo.values())
+        ys = sum(sipa_mo.values())
+        yb = 0.0
+        if wb_df is not None:
+            yb = float(wb_df[wb_df['FY'] == fy_v]['Volume_m3'].sum())
+        yg     = ys - yp - yd
+        yg_pct = round(yg / ys * 100, 1) if ys > 0 else 0
+        # per-unit monthly for detail rows
+        prod_unit_mo = {u: get_mo_unit(cons_base, u, fy_v) for u in prod_avail}
+        dom_unit_mo  = {u: get_mo_unit(cons_base, u, fy_v) for u in dom_avail}
+        sipa_unit_mo = {u: get_mo_unit(cons_base, u, fy_v) for u in sipa1_avail}
+        combined_rows_sa.append({
+            'fy_v': fy_v, 'prod_mo': prod_mo, 'dom_mo': dom_mo,
+            'sipa_mo': sipa_mo, 'ytd_prod': yp, 'ytd_dom': yd,
+            'ytd_sipa': ys, 'ytd_bill': yb, 'ytd_gap': yg, 'ytd_gap_pct': yg_pct,
+            'prod_unit_mo': prod_unit_mo,
+            'dom_unit_mo':  dom_unit_mo,
+            'sipa_unit_mo': sipa_unit_mo,
+        })
+
+    # FY filter
+    if all_fy_nums:
+        _fy_label_opts = ['All FY'] + [f'FY {int(y)}' for y in all_fy_nums]
+    else:
+        _fy_label_opts = ['All FY']
+
+    col_title, _ = st.columns([3, 1])
+    with col_title:
+        st.markdown("#### 📋 Water Consumption Report — Fiscal Year")
+
+    # Filter FY
+    show_fys = all_fy_nums if selected_fy == 'All FY' else                [int(selected_fy.replace('FY ', ''))]
+
+    months_present_sa = [m for m in MONTH_ORDER if any(
+        get_mo_totals(monthly_prod, fy).get(m) or
+        get_mo_totals(monthly_dom,  fy).get(m) or
+        get_mo_totals(monthly_sipa1,fy).get(m)
+        for fy in show_fys
+    )]
+
+    # ── Build HTML table ──────────────────────────────────────────────────────
+    mo_cols = months_present_sa
+
+    def v(val):
+        """Format number: 0 → '—', else comma-separated."""
+        if val is None or val == 0: return '<span style="color:#cbd5e1">—</span>'
+        return f'{int(val):,}'
+
+    def build_report_html(show_fys, combined_rows_sa, mo_cols, wb_df):
+        th_style = ("background:#1e3a5f;color:white;font-weight:700;text-align:center;"
+                    "padding:9px 8px;font-size:12px;border:1px solid #0c4a6e;white-space:nowrap;")
+        th_l     = ("background:#1e3a5f;color:white;font-weight:700;text-align:left;"
+                    "padding:9px 12px;font-size:12px;border:1px solid #0c4a6e;")
+
+        cols_html = f'<th style="{th_l}">Category</th>'
+        for m in mo_cols:
+            cols_html += f'<th style="{th_style}">{m}</th>'
+        cols_html += f'<th style="{th_style}">YTD</th>'
+        if wb_df is not None:
+            cols_html += f'<th style="{th_style}">Water Bill</th>'
+        cols_html += f'<th style="{th_style}">Balance m³</th>'
+        cols_html += f'<th style="{th_style}">Bal %</th>'
+
+        # CSS: no hover override (preserve row color), collapse toggle style
+        html = f"""
+        <style>
+          .sa-table {{border-collapse:collapse;width:100%;font-family:Inter,sans-serif;font-size:13px;}}
+          .sa-table td, .sa-table th {{border:1px solid #e2e8f0;padding:7px 8px;}}
+          .sa-toggle {{cursor:pointer;user-select:none;}}
+          .sa-toggle:hover opacity:0.85;}}
+          .sa-chevron {{display:inline-block;transition:transform .2s;margin-right:6px;font-size:11px;}}
+          .sa-chevron.collapsed {{transform:rotate(-90deg);}}
+        </style>
+        <script>
+        function saToggle(groupId) {{
+          var rows = document.querySelectorAll('.' + groupId);
+          var chev = document.getElementById('chev-' + groupId);
+          var hidden = rows[0] && rows[0].style.display === 'none';
+          rows.forEach(function(r) {{ r.style.display = hidden ? '' : 'none'; }});
+          if (chev) chev.classList.toggle('collapsed', !hidden);
+        }}
+        </script>
+        <div style="overflow-x:auto;">
+        <table class="sa-table">
+          <thead><tr>{cols_html}</tr></thead>
+          <tbody>
+        """
+
+        ncols = len(mo_cols) + 1 + (1 if wb_df is not None else 0) + 2  # total td count
+
+        for fy_v in show_fys:
+            cr = next((r for r in combined_rows_sa if r['fy_v'] == fy_v), None)
+            if not cr: continue
+
+            fid     = f"fy{int(fy_v)}"
+            fy_label = f"FY {int(fy_v)}"
+
+            # ── FY Header ─────────────────────────────────────────────────
+            fy_s = "background:#0c4a6e;color:white;font-weight:800;font-size:14px;"
+            gap_bg = ("#dcfce7;color:#166534" if cr["ytd_gap"] > 200
+                      else "#fee2e2;color:#991b1b" if cr["ytd_gap"] < -200
+                      else "#fef9c3;color:#854d0e")
+            row  = f'<tr class="sa-toggle" onclick="saToggle(\'{fid}\')">'
+            row += (f'<td style="text-align:left;padding:9px 12px;{fy_s}">'
+                    f'<span class="sa-chevron" id="chev-{fid}">▼</span>{fy_label}</td>')
+            for m in mo_cols:
+                row += f'<td style="text-align:center;{fy_s}"></td>'
+            row += f'<td style="text-align:center;{fy_s}"></td>'
+            if wb_df is not None:
+                row += f'<td style="text-align:center;{fy_s}"></td>'
+            row += f'<td style="text-align:center;background:{gap_bg};font-weight:700;">{v(cr["ytd_gap"])}</td>'
+            row += f'<td style="text-align:center;background:{gap_bg};font-weight:700;">{cr["ytd_gap_pct"]:.1f}%</td>'
+            row += '</tr>'
+            html += row
+
+            # helper: build a collapsible section header row (toggle sub-units)
+            def section_header(label, mo_data, ytd_val, bg, sid):
+                s = (f"background:{bg};color:white;font-weight:700;")
+                r  = f'<tr class="{fid} sa-toggle" onclick="saToggle(\'{sid}\')">'
+                r += (f'<td style="padding:7px 12px;{s}">'
+                      f'<span class="sa-chevron" id="chev-{sid}">▼</span>{label}</td>')
+                for m in mo_cols:
+                    r += f'<td style="text-align:center;{s}">{v(mo_data.get(m,0))}</td>'
+                r += f'<td style="text-align:center;{s};font-weight:800;">{v(ytd_val)}</td>'
+                if wb_df is not None:
+                    r += f'<td style="text-align:center;{s}"></td>'
+                r += f'<td style="text-align:center;{s}"></td>'
+                r += f'<td style="text-align:center;{s}"></td>'
+                r += '</tr>'
+                return r
+
+            def sub_rows(unit_mo_dict, text_clr, bg_clr, sid, skip_zero=True):
+                rows_html = ''
+                for u, u_mo in unit_mo_dict.items():
+                    u_ytd = sum(u_mo.values())
+                    if skip_zero and u_ytd == 0: continue
+                    r  = f'<tr class="{fid} {sid}">'
+                    r += (f'<td style="padding:7px 24px;color:{text_clr};'
+                          f'background:{bg_clr};">&nbsp;&nbsp;{u}</td>')
+                    for m in mo_cols:
+                        r += (f'<td style="text-align:center;background:{bg_clr};'
+                              f'color:{text_clr};">{v(u_mo.get(m,0))}</td>')
+                    r += (f'<td style="text-align:center;background:{bg_clr};'
+                          f'color:{text_clr};font-weight:600;">{v(u_ytd)}</td>')
+                    if wb_df is not None:
+                        r += f'<td style="background:{bg_clr};"></td>'
+                    r += f'<td style="background:{bg_clr};"></td>'
+                    r += f'<td style="background:{bg_clr};"></td>'
+                    r += '</tr>'
+                    rows_html += r
+                return rows_html
+
+            # ── SIPA ──────────────────────────────────────────────────────
+            sid_sipa = f"{fid}_sipa"
+            html += section_header("💧 Total SIPA Intake (P1)",
+                                   cr['sipa_mo'], sum(cr['sipa_mo'].values()),
+                                   "#0ea5e9", sid_sipa)
+            html += sub_rows(cr['sipa_unit_mo'], "#0369a1", "#f0f9ff", sid_sipa, skip_zero=False)
+
+            # ── PROD ──────────────────────────────────────────────────────
+            sid_prod = f"{fid}_prod"
+            html += section_header("🏭 Total Production (PROD)",
+                                   cr['prod_mo'], sum(cr['prod_mo'].values()),
+                                   "#10b981", sid_prod)
+            html += sub_rows(cr['prod_unit_mo'], "#166534", "#f0fdf4", sid_prod)
+
+            # ── DOM ───────────────────────────────────────────────────────
+            sid_dom = f"{fid}_dom"
+            html += section_header("🏠 Total Domestic (DOM)",
+                                   cr['dom_mo'], sum(cr['dom_mo'].values()),
+                                   "#f59e0b", sid_dom)
+            html += sub_rows(cr['dom_unit_mo'], "#92400e", "#fffbeb", sid_dom)
+
+            # ── Water Bill ────────────────────────────────────────────────
+            if wb_df is not None and cr['ytd_bill'] > 0:
+                bill_mo = {wrow['Month']: round(float(wrow['Volume_m3']), 0)
+                           for _, wrow in wb_df[wb_df['FY'] == fy_v].iterrows()}
+                wb_s = "background:#eff6ff;color:#1d4ed8;font-weight:700;"
+                sipa_bill_gap_v = cr['ytd_sipa'] - cr['ytd_bill']
+                gap_bg2 = ("#dcfce7;color:#166534" if abs(sipa_bill_gap_v) < 500
+                           else "#fee2e2;color:#991b1b")
+                row  = f'<tr class="{fid}">'
+                row += f'<td style="padding:7px 12px;{wb_s}">💰 Water Bill (Provider)</td>'
+                for m in mo_cols:
+                    row += f'<td style="text-align:center;{wb_s}">{v(bill_mo.get(m,0))}</td>'
+                row += f'<td style="text-align:center;{wb_s};font-weight:800;">{v(cr["ytd_bill"])}</td>'
+                row += f'<td style="text-align:center;{wb_s};font-weight:800;">{v(cr["ytd_bill"])}</td>'
+                row += (f'<td style="text-align:center;background:{gap_bg2};font-weight:700;">'
+                        f'{int(sipa_bill_gap_v):+,}</td>')
+                row += f'<td style="text-align:center;background:{gap_bg2};"></td>'
+                row += '</tr>'
+                html += row
+
+            # Spacer
+            html += f'<tr><td colspan="100" style="background:#f1f5f9;padding:3px;"></td></tr>'
+
+        html += "</tbody></table></div>"
+        return html
+
+    report_html = build_report_html(show_fys, combined_rows_sa, mo_cols, wb_df)
+    st.markdown(report_html, unsafe_allow_html=True)
+    st.caption("Satuan: m³ · Balance = SIPA – (PROD+DOM) · 🟢 >200 wajar · 🔴 <-200 investigasi · Klik header baris untuk expand/collapse")
+
+    # Download CSV
+    dl_rows = []
+    for fy_v in show_fys:
+        cr = next((r for r in combined_rows_sa if r['fy_v'] == fy_v), None)
+        if not cr: continue
+        for section, mo_data, ytd in [
+            ('SIPA Intake', cr['sipa_mo'], cr['ytd_sipa']),
+            ('PROD Total',  cr['prod_mo'], cr['ytd_prod']),
+            ('DOM Total',   cr['dom_mo'],  cr['ytd_dom']),
+        ]:
+            row = {'FY': f'FY {int(fy_v)}', 'Category': section}
+            for m in MONTH_ORDER:
+                row[m] = mo_data.get(m, 0)
+            row['YTD'] = ytd
+            dl_rows.append(row)
+        if cr['ytd_bill'] > 0:
+            row = {'FY': f'FY {int(fy_v)}', 'Category': 'Water Bill'}
+            for m in MONTH_ORDER:
+                bm = wb_df[(wb_df['FY']==fy_v) & (wb_df['Month']==m)] if wb_df is not None else pd.DataFrame()
+                row[m] = float(bm['Volume_m3'].sum()) if len(bm) else 0
+            row['YTD'] = cr['ytd_bill']
+            dl_rows.append(row)
+        row = {'FY': f'FY {int(fy_v)}', 'Category': 'Balance (SIPA-PROD-DOM)',
+               'YTD': cr['ytd_gap'], 'Bal%': cr['ytd_gap_pct']}
+        for m in MONTH_ORDER: row.setdefault(m, '')
+        dl_rows.append(row)
+
+    dl_df_sa = pd.DataFrame(dl_rows)
+    st.download_button(
+        "⬇️ Download Tabel Smart Analysis (CSV)",
+        dl_df_sa.to_csv(index=False).encode('utf-8'),
+        'smart_analysis.csv', 'text/csv'
+    )
+
+    # ── Main chart ────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### 📊 Trend Bulanan — SIPA vs Distribusi vs Water Bill")
+
+    chart_rows_sa = []
+    for cr in combined_rows_sa:
+        fy_v = cr['fy_v']
+        if selected_fy != 'All FY' and f"FY {int(fy_v)}" != selected_fy:
+            continue
+        for mo_v in MONTH_ORDER:
+            sv = cr['sipa_mo'].get(mo_v, 0)
+            pv = cr['prod_mo'].get(mo_v, 0)
+            dv = cr['dom_mo'].get(mo_v, 0)
+            bv = 0.0
+            if wb_df is not None:
+                bm = wb_df[(wb_df['FY'] == fy_v) & (wb_df['Month'] == mo_v)]
+                bv = float(bm['Volume_m3'].sum()) if len(bm) else 0.0
+            if sv == 0 and pv == 0 and dv == 0 and bv == 0:
+                continue
+            chart_rows_sa.append({
+                'Label': f"{mo_v} FY{str(int(fy_v))[2:]}",
+                'SIPA': sv, 'PROD': pv, 'DOM': dv, 'Bill': bv
+            })
+
+    if chart_rows_sa:
+        ch_sa = pd.DataFrame(chart_rows_sa)
+        fig_sa = go.Figure()
+        if ch_sa['SIPA'].sum() > 0:
+            fig_sa.add_trace(go.Bar(
+                name='💧 SIPA Intake', x=ch_sa['Label'], y=ch_sa['SIPA'],
+                marker_color='#0ea5e9',
+                hovertemplate='SIPA: %{y:,.0f} m³<extra></extra>'
+            ))
+        if ch_sa['PROD'].sum() > 0:
+            fig_sa.add_trace(go.Bar(
+                name='🏭 PROD', x=ch_sa['Label'], y=ch_sa['PROD'],
+                marker_color='#10b981',
+                hovertemplate='PROD: %{y:,.0f} m³<extra></extra>'
+            ))
+        if ch_sa['DOM'].sum() > 0:
+            fig_sa.add_trace(go.Bar(
+                name='🏠 DOM', x=ch_sa['Label'], y=ch_sa['DOM'],
+                marker_color='#f59e0b',
+                hovertemplate='DOM: %{y:,.0f} m³<extra></extra>'
+            ))
+        if wb_df is not None and ch_sa['Bill'].sum() > 0:
+            fig_sa.add_trace(go.Scatter(
+                name='💰 Water Bill', x=ch_sa['Label'], y=ch_sa['Bill'],
+                mode='lines+markers',
+                line=dict(color='#ef4444', width=3, dash='dot'),
+                marker=dict(size=9, symbol='diamond'),
+                hovertemplate='Bill: %{y:,.0f} m³<extra></extra>'
+            ))
+        fig_sa.update_layout(
+            barmode='group', height=400,
+            paper_bgcolor='white', plot_bgcolor='white',
+            margin=dict(l=60, r=20, t=20, b=80),
+            xaxis=dict(tickangle=-35, tickfont=dict(size=10), showgrid=False),
+            yaxis=dict(title='m³/bulan', showgrid=True,
+                       gridcolor='#f1f5f9', rangemode='tozero'),
+            legend=dict(orientation='h', y=1.08, font=dict(size=11)),
+            hovermode='x unified'
+        )
+        st.plotly_chart(fig_sa, use_container_width=True)
+
+        # Gap chart (only when both SIPA and distribution exist)
+        if ch_sa['SIPA'].sum() > 0 and (ch_sa['PROD'].sum() + ch_sa['DOM'].sum()) > 0:
+            ch_sa['Gap'] = ch_sa['SIPA'] - ch_sa['PROD'] - ch_sa['DOM']
+            fig_gap_sa = go.Figure(go.Bar(
+                x=ch_sa['Label'],
+                y=ch_sa['Gap'],
+                marker_color=['#10b981' if g >= 0 else '#ef4444'
+                              for g in ch_sa['Gap']],
+                text=[f"{v:+,.0f}" for v in ch_sa['Gap']],
+                textposition='outside',
+                textfont=dict(size=10),
+                hovertemplate='Gap: %{y:+,.0f} m³<extra></extra>'
+            ))
+            fig_gap_sa.add_hline(y=0, line_dash='dash',
+                                  line_color='#94a3b8', line_width=1)
+            fig_gap_sa.update_layout(
+                title=dict(text='Gap Bulanan: SIPA – (PROD + DOM)',
+                           font=dict(size=13, color='#1e293b')),
+                height=260, paper_bgcolor='white', plot_bgcolor='white',
+                margin=dict(l=60, r=20, t=40, b=70),
+                xaxis=dict(tickangle=-35, tickfont=dict(size=10), showgrid=False),
+                yaxis=dict(title='m³', showgrid=True, gridcolor='#f1f5f9'),
+            )
+            st.plotly_chart(fig_gap_sa, use_container_width=True)
+
+    # ── Water Bill detail ─────────────────────────────────────────────────────
+    if wb_df is not None:
+        st.markdown("---")
+        st.markdown("#### 💰 Rekap Water Bill per Fiscal Year")
+        wb_show = wb_df.copy()
+        if selected_fy != 'All FY':
+            wb_show = wb_show[wb_show['FY'] == int(selected_fy.replace('FY ', ''))]
+        wb_grp = wb_show.groupby('FY').agg(
+            Vol=('Volume_m3', 'sum'),
+            Amt=('Amount_Rp', 'sum'),
+            Avg=('Volume_m3', 'mean'),
+            Mn=('Volume_m3',  'min'),
+            Mx=('Volume_m3',  'max'),
+            N=('Volume_m3',   'count')
+        ).reset_index()
+        wb_grp['FY']    = wb_grp['FY'].apply(lambda x: f'FY {int(x)}')
+        wb_grp['Rp/m³'] = (wb_grp['Amt'] / wb_grp['Vol'].replace(0, 1)).round(0)
+        wb_grp = wb_grp.rename(columns={
+            'Vol': 'Total Volume (m³)', 'Amt': 'Total Tagihan (Rp)',
+            'Avg': 'Avg/Bln (m³)',      'Mn':  'Min (m³)',
+            'Mx':  'Max (m³)',           'N':   'Bulan Data'
+        })
+        fmt_wb_map = {
+            c: '{:,.0f}' for c in
+            ['Total Volume (m³)', 'Avg/Bln (m³)', 'Min (m³)', 'Max (m³)']
+        }
+        fmt_wb_map.update({
+            'Total Tagihan (Rp)': 'Rp {:,.0f}',
+            'Rp/m³':              'Rp {:,.0f}'
+        })
+        st.dataframe(
+            wb_grp.style
+                .format({k: v for k, v in fmt_wb_map.items()
+                         if k in wb_grp.columns})
+                .set_properties(**{
+                    'text-align': 'center', 'border': '1px solid #e2e8f0',
+                    'padding': '8px 12px', 'font-size': '13px'
+                })
+                .set_properties(subset=['FY'], **{
+                    'background-color': '#0c4a6e',
+                    'color': 'white', 'font-weight': 'bold'
+                })
+                .set_table_styles([{
+                    'selector': 'thead th',
+                    'props': [
+                        ('background-color', '#1e3a5f'), ('color', 'white'),
+                        ('font-weight', 'bold'), ('text-align', 'center'),
+                        ('padding', '10px')
+                    ]
+                }]),
+            use_container_width=True, hide_index=True
+        )
+    else:
+        st.markdown("---")
+        st.info(
+            "💡 Upload **Water Bill** di sidebar (bagian 💡 Smart Analysis) untuk "
+            "membandingkan volume tagihan provider dengan meter SIPA."
+        )
+
+    # ── Auto notes ────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### 📝 Catatan Otomatis")
+
+    notes_sa = []
+
+    if not monthly_prod.empty:
+        fps = build_fy_summary(monthly_prod, prod_avail)
+        if not fps.empty:
+            if len(fps) > 1:
+                best  = fps.loc[fps['YTD'].idxmax()]
+                worst = fps.loc[fps['YTD'].idxmin()]
+                notes_sa.append(
+                    f"🏭 **PROD** — FY tertinggi **FY {int(best['FY'])}** "
+                    f"({best['YTD']:,.0f} m³), "
+                    f"terendah **FY {int(worst['FY'])}** ({worst['YTD']:,.0f} m³)."
+                )
+            else:
+                notes_sa.append(
+                    f"🏭 **PROD** — Total {selected_fy}: "
+                    f"**{fps['YTD'].sum():,.0f} m³**."
+                )
+
+    if not monthly_dom.empty:
+        fds = build_fy_summary(monthly_dom, dom_avail)
+        if not fds.empty:
+            cv = (fds['YTD'].std() / fds['YTD'].mean()
+                  if fds['YTD'].mean() > 0 else 0)
+            notes_sa.append(
+                f"🏠 **DOM** — Rata-rata **{fds['YTD'].mean():,.0f} m³/FY**. "
+                + ("Konsumsi stabil antar FY." if cv < 0.2
+                   else "Ada variasi cukup besar antar FY — perlu dicek lebih lanjut.")
+            )
+
+    if chart_rows_sa:
+        ch2 = pd.DataFrame(chart_rows_sa)
+        if ch2['SIPA'].sum() > 0 and (ch2['PROD'].sum() + ch2['DOM'].sum()) > 0:
+            ch2['Gap'] = ch2['SIPA'] - ch2['PROD'] - ch2['DOM']
+            neg     = (ch2['Gap'] < -200).sum()
+            avg_gap = ch2['Gap'].mean()
+            if neg > 0:
+                notes_sa.append(
+                    f"⚠️ **Balance** — {neg} bulan dengan gap negatif "
+                    f"(distribusi melebihi intake SIPA). "
+                    f"Perlu verifikasi meter atau cek sumber air lain."
+                )
+            else:
+                sipa_avg = ch2['SIPA'].mean()
+                pct_loss = avg_gap / sipa_avg * 100 if sipa_avg > 0 else 0
+                notes_sa.append(
+                    f"✅ **Balance** — Tidak ada gap negatif signifikan. "
+                    f"Rata-rata losses ≈ {avg_gap:,.0f} m³/bulan "
+                    f"({pct_loss:.1f}% dari intake) — wajar."
+                )
+
+    if wb_df is not None and total_sipa1 > 0 and wb_total > 0:
+        pct_diff = (total_sipa1 - wb_total) / wb_total * 100
+        notes_sa.append(
+            f"💰 **SIPA vs Water Bill** — SIPA {total_sipa1:,.0f} m³ vs "
+            f"Bill {wb_total:,.0f} m³ (selisih {pct_diff:+.1f}%). "
+            + ("Sangat selaras — meter bekerja baik." if abs(pct_diff) < 5
+               else "Selisih wajar (losses / beda waktu baca)." if abs(pct_diff) < 15
+               else "Selisih besar — pertimbangkan kalibrasi meter.")
+        )
+    else:
+        notes_sa.append(
+            "💰 **Water Bill** — Upload file tagihan di sidebar untuk "
+            "perbandingan dengan meter SIPA."
+        )
+
+    if not notes_sa:
+        notes_sa.append(
+            "📌 Pilih unit PROD, DOM, dan SIPA di sidebar untuk "
+            "mendapatkan analisis otomatis."
+        )
+
+    for n in notes_sa:
+        bg  = '#f0fdf4' if '✅' in n else ('#fff7ed' if '⚠️' in n else '#f0f9ff')
+        bdr = '#86efac' if '✅' in n else ('#fdba74' if '⚠️' in n else '#7dd3fc')
+        st.markdown(
+            f"<div style='background:{bg};border-left:4px solid {bdr};"
+            f"border-radius:6px;padding:10px 16px;margin-bottom:8px;"
+            f"font-size:13px;'>{n}</div>",
+            unsafe_allow_html=True
         )
 
 
