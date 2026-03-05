@@ -2050,7 +2050,7 @@ if uploaded is None or raw_df.empty:
       <div style="font-size:24px;font-weight:700;color:#0c4a6e;margin-bottom:12px;">
         Upload Your Water Meter Data File</div>
       <div style="font-size:15px;color:#64748b;max-width:500px;margin:0 auto 32px;">
-        Upload <b>waterawdata_GI.xlsx</b> or a file with the same format via the sidebar
+        Upload <b>waterawdata.xlsx</b> or a file with the same format via the sidebar
         to start analysing water consumption.
       </div>
       <div style="display:flex;justify-content:center;gap:24px;flex-wrap:wrap;">
@@ -2616,4 +2616,5 @@ st.markdown("""
   PT Güntner Indonesia &nbsp;|&nbsp; Water Monitoring System
 </div>
 """, unsafe_allow_html=True)
+
 
