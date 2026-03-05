@@ -376,7 +376,6 @@ def make_line_daily(cons: pd.DataFrame, loc_map: dict, selected_prods: list) -> 
 
     x_lbl = [fmt_date(d) for d in cons.index]
 
-    # Classify units: top units (sum >= 10% of max) go left, rest go right
     totals  = {p: float(cons[p].sum()) for p in cols}
     max_tot = max(totals.values()) if totals else 1
     large   = [p for p in cols if totals[p] >= max_tot * 0.10]
@@ -393,7 +392,7 @@ def make_line_daily(cons: pd.DataFrame, loc_map: dict, selected_prods: list) -> 
             mode='lines+markers', name=prod,
             line=dict(color=color, width=2),
             marker=dict(size=5, color=color),
-            hovertemplate=f'<b>{prod}</b> — {area}<br>%{{x}}<br>%{{y:,.2f}} m³<extra></extra>'
+            hovertemplate='<b>' + prod + '</b> — ' + area + '<br>%{x}<br>%{y:,.2f} m³<extra></extra>'
         ), secondary_y=False)
 
     for prod in small:
@@ -402,15 +401,13 @@ def make_line_daily(cons: pd.DataFrame, loc_map: dict, selected_prods: list) -> 
         fig.add_trace(go.Scatter(
             x=x_lbl,
             y=[float(v) for v in cons[prod].tolist()],
-            mode='lines+markers', name=f'{prod} ▷',
+            mode='lines+markers', name=prod + ' ▷',
             line=dict(color=color, width=2, dash='dot'),
             marker=dict(size=5, color=color, symbol='diamond'),
-            hovertemplate=f'<b>{prod}</b> — {area}<br>%{{x}}<br>%{{y:,.2f}} m³ (right axis)<extra></extra>'
+            hovertemplate='<b>' + prod + '</b> — ' + area + '<br>%{x}<br>%{y:,.2f} m³ (right)<extra></extra>'
         ), secondary_y=True)
 
-    title_txt = 'Daily Consumption Trend by Unit (m³/day)'
-    if small:
-        title_txt += ' — Dual Axis'
+    title_txt = 'Daily Consumption Trend by Unit (m³/day)' + (' — Dual Axis' if small else '')
 
     fig.update_layout(
         title=dict(text=title_txt, font=dict(size=15, color='#1e293b')),
@@ -444,6 +441,7 @@ def make_line_daily(cons: pd.DataFrame, loc_map: dict, selected_prods: list) -> 
     return fig
 
 
+
 def make_stacked_bar(cons: pd.DataFrame, loc_map: dict, selected_prods: list) -> go.Figure:
     fig = go.Figure()
     x_lbl = [fmt_date(d) for d in cons.index]
@@ -454,7 +452,7 @@ def make_stacked_bar(cons: pd.DataFrame, loc_map: dict, selected_prods: list) ->
         fig.add_trace(go.Bar(
             x=x_lbl, y=cons[prod], name=prod,
             marker_color=color,
-            hovertemplate=f'<b>{prod}</b><br>%{{x}}<br>%{{y:,.2f}} m³<extra></extra>'
+            hovertemplate='<b>' + prod + '</b><br>%{x}<br>%{y:,.2f} m³<extra></extra>'
         ))
     fig.update_layout(
         title=dict(text='Daily Consumption — Stacked (m³)', font=dict(size=15, color='#1e293b')),
@@ -542,7 +540,7 @@ def make_cumulative(cons: pd.DataFrame, loc_map: dict, selected_prods: list) -> 
             line=dict(color=color, width=2),
             fill='tozeroy',
             fillcolor=f'rgba({r},{g},{b},0.08)',
-            hovertemplate=f'<b>{prod}</b> cumulative<br>%{{x}}<br>%{{y:,.1f}} m³<extra></extra>'
+            hovertemplate='<b>' + prod + '</b> cumulative<br>%{x}<br>%{y:,.1f} m³<extra></extra>'
         ))
     fig.update_layout(
         title=dict(text='Cumulative Consumption (m³) — Log Scale', font=dict(size=15, color='#1e293b')),
@@ -609,6 +607,543 @@ def get_peak_day_info(cons_active: pd.DataFrame) -> tuple:
     peak_date = daily_totals.idxmax()
     peak_str  = pd.Timestamp(peak_date).strftime('%d %b %Y (%A)')
     return peak_val, peak_str
+
+
+# ============================================================================
+# EXCEL EXPORT
+# ============================================================================
+
+def generate_excel_report(
+    raw_filtered: pd.DataFrame,
+    cons: pd.DataFrame,
+    cons_active: pd.DataFrame,
+    cons_totals: pd.Series,
+    loc_map: dict,
+    selected_prods: list,
+    period_str: str,
+    total_all: float,
+    n_days: int,
+) -> bytes:
+    import io as _io
+    import openpyxl
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+
+    HEADER_FILL = PatternFill('solid', start_color='0C4A6E')
+    HEADER_FONT = Font(bold=True, color='FFFFFF', name='Arial', size=11)
+    SUBHDR_FILL = PatternFill('solid', start_color='0EA5E9')
+    SUBHDR_FONT = Font(bold=True, color='FFFFFF', name='Arial', size=10)
+    ALT_FILL    = PatternFill('solid', start_color='F0F9FF')
+    TOTAL_FILL  = PatternFill('solid', start_color='0C4A6E')
+    TOTAL_FONT  = Font(bold=True, color='FFFFFF', name='Arial', size=10)
+    NORMAL_FONT = Font(name='Arial', size=10)
+    BOLD_FONT   = Font(bold=True, name='Arial', size=10)
+    thin        = Side(style='thin', color='E2E8F0')
+    BORDER      = Border(left=thin, right=thin, top=thin, bottom=thin)
+    CENTER      = Alignment(horizontal='center', vertical='center')
+    LEFT        = Alignment(horizontal='left', vertical='center')
+
+    def set_row(ws, row, values, fill=None, font=None, align=None):
+        for col, val in enumerate(values, 1):
+            c = ws.cell(row=row, column=col, value=val)
+            if fill:  c.fill      = fill
+            if font:  c.font      = font
+            if align: c.alignment = align
+            c.border = BORDER
+
+    def set_col_widths(ws, widths):
+        for col, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(col)].width = w
+
+    def short_area(prod):
+        a = loc_map.get(prod, '')
+        return a.replace(f'{prod} - ', '').replace(prod, '').strip(' -')
+
+    avg_daily = float(cons_active.sum(axis=1).mean()) if len(cons_active) > 0 else 0
+    peak_val, peak_date_str = get_peak_day_info(cons_active)
+    active_cols = [p for p in selected_prods if p in cons.columns]
+
+    # =========================================================================
+    # SHEET 1 — Summary
+    # =========================================================================
+    ws1 = wb.active
+    ws1.title = 'Summary'
+    ws1.sheet_view.showGridLines = False
+
+    ws1.merge_cells('A1:F1')
+    ws1['A1'].value = 'Water Consumption Report'
+    ws1['A1'].font  = Font(bold=True, name='Arial', size=16, color='0C4A6E')
+    ws1['A1'].alignment = CENTER
+    ws1['A1'].fill  = PatternFill('solid', start_color='F0F9FF')
+    ws1.row_dimensions[1].height = 32
+
+    ws1.merge_cells('A2:F2')
+    ws1['A2'].value = f'Period: {period_str}  |  Units: {", ".join(selected_prods)}'
+    ws1['A2'].font  = Font(name='Arial', size=10, color='64748B')
+    ws1['A2'].alignment = CENTER
+    ws1.row_dimensions[2].height = 20
+
+    ws1.merge_cells('A4:F4')
+    ws1['A4'].value = 'KEY PERFORMANCE INDICATORS'
+    ws1['A4'].font  = Font(bold=True, name='Arial', size=11, color='FFFFFF')
+    ws1['A4'].fill  = HEADER_FILL
+    ws1['A4'].alignment = CENTER
+    ws1.row_dimensions[4].height = 22
+
+    set_row(ws1, 5, ['Metric', 'Value', 'Unit', '', 'Metric', 'Value'],
+            fill=SUBHDR_FILL, font=SUBHDR_FONT, align=CENTER)
+
+    kpis_l = [('Total Consumption', f'{total_all:,.1f}', 'm³'),
+              ('Days of Data',      str(n_days),         'days'),
+              ('Average / Day',     f'{avg_daily:,.1f}', 'm³/day')]
+    kpis_r = [('Peak Day Value',    f'{peak_val:,.1f}',  'm³'),
+              ('Peak Day Date',     peak_date_str,        ''),
+              ('Units Monitored',   str(len(selected_prods)), 'units')]
+
+    for i, ((lk, lv, lu), (rk, rv, _)) in enumerate(zip(kpis_l, kpis_r), 6):
+        fill = ALT_FILL if i % 2 == 0 else PatternFill()
+        for col, val in enumerate([lk, lv, lu, '', rk, rv], 1):
+            c = ws1.cell(row=i, column=col, value=val)
+            c.font      = BOLD_FONT if col in (1, 5) else NORMAL_FONT
+            c.fill      = fill
+            c.border    = BORDER
+            c.alignment = LEFT if col in (1, 5) else CENTER
+
+    ws1.merge_cells('A10:G10')
+    ws1['A10'].value = 'UNIT STATISTICS'
+    ws1['A10'].font  = Font(bold=True, name='Arial', size=11, color='FFFFFF')
+    ws1['A10'].fill  = HEADER_FILL
+    ws1['A10'].alignment = CENTER
+    ws1.row_dimensions[10].height = 22
+
+    set_row(ws1, 11,
+            ['Unit', 'Area', 'Total (m³)', 'Avg/day (m³)', 'Max/day (m³)', 'Min/day (m³)', '% of Total'],
+            fill=SUBHDR_FILL, font=SUBHDR_FONT, align=CENTER)
+
+    for i, prod in enumerate(selected_prods, 12):
+        if prod not in cons_active.columns: continue
+        d     = cons_active[prod]
+        d_pos = d[d > 0]
+        pct   = round(float(d.sum()) / total_all * 100, 1) if total_all > 0 else 0
+        row_v = [prod, short_area(prod),
+                 round(float(d.sum()), 1),
+                 round(float(d_pos.mean()), 2) if len(d_pos) else 0,
+                 round(float(d_pos.max()),  1) if len(d_pos) else 0,
+                 round(float(d_pos.min()),  1) if len(d_pos) else 0,
+                 f'{pct:.1f}%']
+        fill = ALT_FILL if i % 2 == 0 else PatternFill()
+        for col, val in enumerate(row_v, 1):
+            c = ws1.cell(row=i, column=col, value=val)
+            c.font = NORMAL_FONT; c.fill = fill; c.border = BORDER
+            c.alignment = LEFT if col <= 2 else CENTER
+
+    tr = 12 + len(selected_prods)
+    set_row(ws1, tr, ['TOTAL', '', f'{total_all:,.1f}', '', '', '', '100.0%'],
+            fill=TOTAL_FILL, font=TOTAL_FONT, align=CENTER)
+    set_col_widths(ws1, [14, 30, 14, 15, 15, 15, 12])
+
+    # =========================================================================
+    # SHEET 2 — Raw Data
+    # =========================================================================
+    ws2 = wb.create_sheet('Raw Data')
+    ws2.sheet_view.showGridLines = False
+
+    ws2.merge_cells('A1:D1')
+    ws2['A1'].value = f'Raw Data — {period_str}'
+    ws2['A1'].font  = Font(bold=True, name='Arial', size=13, color='0C4A6E')
+    ws2['A1'].alignment = CENTER
+    ws2['A1'].fill  = PatternFill('solid', start_color='F0F9FF')
+    ws2.row_dimensions[1].height = 28
+
+    set_row(ws2, 2, ['Date', 'Location', 'Unit (Pompa)', 'Water Indicator (m³)'],
+            fill=HEADER_FILL, font=HEADER_FONT, align=CENTER)
+
+    raw_exp = raw_filtered.copy()
+    raw_exp['Date'] = pd.to_datetime(raw_exp['Date']).dt.strftime('%d-%b-%Y')
+    raw_exp = raw_exp.sort_values(['Pompa', 'Date'])
+
+    for i, (_, row) in enumerate(raw_exp.iterrows(), 3):
+        fill = ALT_FILL if i % 2 == 0 else PatternFill()
+        vals = [row.get('Date',''), row.get('Location',''),
+                row.get('Pompa',''), round(float(row.get('Water_Indicator', 0)), 2)]
+        for col, val in enumerate(vals, 1):
+            c = ws2.cell(row=i, column=col, value=val)
+            c.font = NORMAL_FONT; c.fill = fill; c.border = BORDER
+            c.alignment = LEFT if col <= 3 else CENTER
+            if col == 4: c.number_format = '#,##0.00'
+
+    set_col_widths(ws2, [14, 32, 14, 22])
+
+    # =========================================================================
+    # SHEET 3 — Water Usage (m³)
+    # =========================================================================
+    ws3 = wb.create_sheet('Water Usage (m3)')
+    ws3.sheet_view.showGridLines = False
+
+    ncols = len(active_cols)
+    ws3.merge_cells(f'A1:{get_column_letter(ncols + 2)}1')
+    ws3['A1'].value = f'Daily Water Consumption (m³) — {period_str}'
+    ws3['A1'].font  = Font(bold=True, name='Arial', size=13, color='0C4A6E')
+    ws3['A1'].alignment = CENTER
+    ws3['A1'].fill  = PatternFill('solid', start_color='F0F9FF')
+    ws3.row_dimensions[1].height = 28
+
+    # Area sub-header row
+    for col, val in enumerate(['Date'] + [short_area(p) for p in active_cols] + ['TOTAL'], 1):
+        c = ws3.cell(row=2, column=col, value=val)
+        c.font = Font(italic=True, name='Arial', size=9, color='0C4A6E')
+        c.fill = PatternFill('solid', start_color='E0F2FE')
+        c.alignment = CENTER; c.border = BORDER
+
+    set_row(ws3, 3, ['Date'] + active_cols + ['TOTAL'],
+            fill=HEADER_FILL, font=HEADER_FONT, align=CENTER)
+
+    cons_disp = cons.iloc[1:]
+    for i, (date, row) in enumerate(cons_disp.iterrows(), 4):
+        fill = ALT_FILL if i % 2 == 0 else PatternFill()
+        row_total = sum(float(row.get(p, 0)) for p in active_cols)
+        vals = [fmt_date(date)] + [round(float(row.get(p, 0)), 2) for p in active_cols] + [round(row_total, 2)]
+        for col, val in enumerate(vals, 1):
+            c = ws3.cell(row=i, column=col, value=val)
+            c.font = NORMAL_FONT; c.fill = fill; c.border = BORDER
+            c.alignment = LEFT if col == 1 else CENTER
+            if col > 1: c.number_format = '#,##0.00'
+
+    tr3 = 4 + len(cons_disp)
+    grand = ['GRAND TOTAL'] + [round(float(cons_totals.get(p, 0)), 1) for p in active_cols] + [round(total_all, 1)]
+    set_row(ws3, tr3, grand, fill=TOTAL_FILL, font=TOTAL_FONT, align=CENTER)
+
+    # Monthly summary
+    br = tr3 + 2
+    ws3.merge_cells(f'A{br}:{get_column_letter(ncols+2)}{br}')
+    ws3.cell(row=br, column=1).value = 'MONTHLY SUMMARY'
+    ws3.cell(row=br, column=1).font  = Font(bold=True, name='Arial', size=11, color='FFFFFF')
+    ws3.cell(row=br, column=1).fill  = HEADER_FILL
+    ws3.cell(row=br, column=1).alignment = CENTER
+
+    set_row(ws3, br+1, ['Month'] + active_cols + ['TOTAL'],
+            fill=SUBHDR_FILL, font=SUBHDR_FONT, align=CENTER)
+
+    tmp_c = cons.copy()
+    tmp_c.index = pd.to_datetime(tmp_c.index)
+    monthly = tmp_c.resample('ME').sum()
+    for i, (mdate, mrow) in enumerate(monthly.iterrows(), br + 2):
+        fill = ALT_FILL if i % 2 == 0 else PatternFill()
+        mt = sum(float(mrow.get(p, 0)) for p in active_cols)
+        mv = [mdate.strftime('%B %Y')] + [round(float(mrow.get(p,0)),1) for p in active_cols] + [round(mt,1)]
+        for col, val in enumerate(mv, 1):
+            c = ws3.cell(row=i, column=col, value=val)
+            c.font = NORMAL_FONT; c.fill = fill; c.border = BORDER
+            c.alignment = LEFT if col == 1 else CENTER
+            if col > 1: c.number_format = '#,##0.0'
+
+    set_col_widths(ws3, [14] + [13]*ncols + [13])
+
+    # =========================================================================
+    # SHEET 4 — Native Excel Charts (read from Water Usage (m3) sheet data)
+    # =========================================================================
+    from openpyxl.chart import (BarChart, LineChart, PieChart,
+                                 AreaChart, Reference, Series)
+    from openpyxl.chart.series import SeriesLabel
+    from openpyxl.chart.label import DataLabelList
+
+    ws4 = wb.create_sheet('Charts')
+    ws4.sheet_view.showGridLines = False
+    from openpyxl.chart import (BarChart, LineChart, PieChart, AreaChart, Reference)
+    from openpyxl.chart.series import SeriesLabel
+    from openpyxl.chart.label import DataLabelList
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    # A-H (1-8) : visible summary table
+    # I (9)     : spacer
+    # J+ (10+)  : hidden helper data for chart references
+    col_widths = {'A': 11, 'B': 26, 'C': 13, 'D': 14, 'E': 14, 'F': 11, 'G': 18, 'H': 11}
+    for ltr, w in col_widths.items():
+        ws4.column_dimensions[ltr].width = w
+    ws4.column_dimensions['I'].width = 2
+    for col in range(10, 80):
+        ws4.column_dimensions[get_column_letter(col)].width = 0.1
+
+    CHART_W        = 28
+    CHART_H        = 14
+    ROW_H_PT       = 15.0
+    CM_PER_PT      = 0.0353
+    rows_per_chart = int(CHART_H / (ROW_H_PT * CM_PER_PT)) + 5
+
+    data_start_row = 4
+    data_end_row   = tr3 - 1
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ROW 1 — Title banner
+    # ══════════════════════════════════════════════════════════════════════════
+    ws4.merge_cells('A1:H1')
+    c = ws4.cell(row=1, column=1, value=f'Visualisations \u2014 {period_str}')
+    c.font = Font(bold=True, name='Arial', size=14, color='0C4A6E')
+    c.fill = PatternFill('solid', start_color='F0F9FF')
+    c.alignment = CENTER
+    ws4.row_dimensions[1].height = 30
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ROW 2 — "Show Location Name?" toggle  (dropdown YES / NO in cell H2)
+    # ══════════════════════════════════════════════════════════════════════════
+    ws4.row_dimensions[2].height = 22
+    ws4.merge_cells('A2:F2')
+    lbl = ws4.cell(row=2, column=1,
+                   value='\u2699  Show Location Name in Chart Labels?  \u2192  change cell H2')
+    lbl.font = Font(bold=True, name='Arial', size=10, color='0C4A6E')
+    lbl.fill = PatternFill('solid', start_color='E0F2FE')
+    lbl.alignment = LEFT
+
+    note = ws4.cell(row=2, column=7,
+                    value='YES = with area  |  NO = unit only')
+    note.font = Font(italic=True, name='Arial', size=9, color='64748B')
+    note.alignment = LEFT
+
+    ws4['H2'] = 'YES'
+    tc = ws4['H2']
+    tc.font      = Font(bold=True, name='Arial', size=11, color='FFFFFF')
+    tc.fill      = PatternFill('solid', start_color='0EA5E9')
+    tc.alignment = CENTER
+    tc.border    = BORDER
+
+    dv = DataValidation(type='list', formula1='"YES,NO"', allow_blank=False)
+    dv.sqref = 'H2'
+    dv.showDropDown = False
+    ws4.add_data_validation(dv)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ROWS 3+ — Visible Summary Table  (cols A-H)
+    # ══════════════════════════════════════════════════════════════════════════
+    tbl_hdr_row = 3
+    ws4.row_dimensions[tbl_hdr_row].height = 20
+    ws4.merge_cells(f'A{tbl_hdr_row}:H{tbl_hdr_row}')
+    th = ws4.cell(row=tbl_hdr_row, column=1,
+                  value='\U0001f4ca  Data Summary  \u2014  source for charts below')
+    th.font = Font(bold=True, name='Arial', size=11, color='FFFFFF')
+    th.fill = HEADER_FILL; th.alignment = CENTER
+
+    hdrs = ['Unit', 'Area / Location', 'Total (m\u00b3)', 'Avg/day (m\u00b3)',
+            'Max/day (m\u00b3)', '% of Total', 'Active Days', 'Peak Day']
+    hdr_row = tbl_hdr_row + 1
+    ws4.row_dimensions[hdr_row].height = 18
+    for col, h in enumerate(hdrs, 1):
+        c = ws4.cell(row=hdr_row, column=col, value=h)
+        c.font = SUBHDR_FONT; c.fill = SUBHDR_FILL
+        c.alignment = CENTER; c.border = BORDER
+
+    tbl_data_start = hdr_row + 1
+    for i, prod in enumerate(active_cols, tbl_data_start):
+        d     = cons_active[prod] if prod in cons_active.columns else pd.Series(dtype=float)
+        d_pos = d[d > 0]
+        pct   = round(float(d.sum()) / total_all * 100, 1) if total_all > 0 else 0
+        area  = short_area(prod)
+        peak_date = ''
+        if len(d_pos):
+            try:
+                peak_date = pd.to_datetime(d.idxmax()).strftime('%d-%b-%Y')
+            except Exception:
+                peak_date = str(d.idxmax())
+        row_v = [prod, area,
+                 round(float(d.sum()), 1),
+                 round(float(d_pos.mean()), 2) if len(d_pos) else 0,
+                 round(float(d_pos.max()),  1) if len(d_pos) else 0,
+                 f'{pct:.1f}%',
+                 int(len(d_pos)),
+                 peak_date]
+        fill = ALT_FILL if i % 2 == 0 else PatternFill()
+        ws4.row_dimensions[i].height = 16
+        for col, val in enumerate(row_v, 1):
+            c = ws4.cell(row=i, column=col, value=val)
+            c.font = NORMAL_FONT; c.fill = fill; c.border = BORDER
+            c.alignment = LEFT if col <= 2 else CENTER
+            if col in (3, 4, 5): c.number_format = '#,##0.0'
+
+    tbl_data_end  = tbl_data_start + len(active_cols) - 1
+    grand_row_n   = tbl_data_end + 1
+    ws4.row_dimensions[grand_row_n].height = 16
+    grand_v = ['TOTAL', '', round(total_all, 1), '', '', '100.0%', '', '']
+    for col, val in enumerate(grand_v, 1):
+        c = ws4.cell(row=grand_row_n, column=col, value=val)
+        c.font = TOTAL_FONT; c.fill = TOTAL_FILL
+        c.alignment = CENTER; c.border = BORDER
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HIDDEN HELPER TABLES (col J=10 onward) — chart data sources
+    # Label column uses Excel IF formula referencing H2 toggle
+    # ══════════════════════════════════════════════════════════════════════════
+    HLP_ROW = 3
+
+    # Helper A: Label + Total  (J=10, K=11)
+    HA_LBL = 10; HA_VAL = 11
+    ws4.cell(row=HLP_ROW, column=HA_LBL, value='Label_A')
+    ws4.cell(row=HLP_ROW, column=HA_VAL, value='Total (m\u00b3)')
+    for i, prod in enumerate(active_cols, HLP_ROW + 1):
+        area  = short_area(prod)
+        lw = f'{prod} - {area}' if area else prod
+        lo = prod
+        ws4.cell(row=i, column=HA_LBL, value=f'=IF($H$2="YES","{lw}","{lo}")')
+        ws4.cell(row=i, column=HA_VAL,
+                 value=round(float(cons_totals.get(prod, 0)), 1))
+    ha_end           = HLP_ROW + len(active_cols)
+    totals_label_ref = Reference(ws4, min_col=HA_LBL, min_row=HLP_ROW+1, max_row=ha_end)
+    totals_data_ref  = Reference(ws4, min_col=HA_VAL, min_row=HLP_ROW,   max_row=ha_end)
+
+    # Helper B: Avg/Max  (L=12, M=13, N=14)
+    HB_LBL = 12; HB_AVG = 13; HB_MAX = 14
+    ws4.cell(row=HLP_ROW, column=HB_LBL, value='Label_B')
+    ws4.cell(row=HLP_ROW, column=HB_AVG, value='Avg/day')
+    ws4.cell(row=HLP_ROW, column=HB_MAX, value='Max/day')
+    for i, prod in enumerate(active_cols, HLP_ROW + 1):
+        d     = cons_active[prod] if prod in cons_active.columns else pd.Series(dtype=float)
+        d_pos = d[d > 0]
+        area  = short_area(prod)
+        lw = f'{prod} - {area}' if area else prod
+        lo = prod
+        ws4.cell(row=i, column=HB_LBL, value=f'=IF($H$2="YES","{lw}","{lo}")')
+        ws4.cell(row=i, column=HB_AVG,
+                 value=round(float(d_pos.mean()), 2) if len(d_pos) else 0)
+        ws4.cell(row=i, column=HB_MAX,
+                 value=round(float(d_pos.max()),  1) if len(d_pos) else 0)
+    hb_end     = HLP_ROW + len(active_cols)
+    am_cat_ref = Reference(ws4, min_col=HB_LBL, min_row=HLP_ROW+1, max_row=hb_end)
+    am_avg_ref = Reference(ws4, min_col=HB_AVG, min_row=HLP_ROW,   max_row=hb_end)
+    am_max_ref = Reference(ws4, min_col=HB_MAX, min_row=HLP_ROW,   max_row=hb_end)
+
+    # Helper C: Cumulative  (O=15, P=16+)
+    HC_DATE = 15; HC_START = 16
+    ws4.cell(row=HLP_ROW, column=HC_DATE, value='Date')
+    for j, prod in enumerate(active_cols):
+        area  = short_area(prod)
+        lw = f'{prod} - {area}' if area else prod
+        lo = prod
+        ws4.cell(row=HLP_ROW, column=HC_START+j,
+                 value=f'=IF($H$2="YES","{lw}","{lo}")')
+    cons_disp2 = cons.iloc[1:]
+    for k, (date, _) in enumerate(cons_disp2.iterrows(), HLP_ROW + 1):
+        ws4.cell(row=k, column=HC_DATE, value=fmt_date(date))
+        for j, prod in enumerate(active_cols):
+            if prod in cons_active.columns:
+                cumval = float(cons_active[prod].iloc[:k - HLP_ROW].sum())
+            else:
+                cumval = 0.0
+            ws4.cell(row=k, column=HC_START+j, value=round(cumval, 2))
+    hc_end       = HLP_ROW + len(cons_disp2)
+    cum_date_ref = Reference(ws4, min_col=HC_DATE, min_row=HLP_ROW+1, max_row=hc_end)
+    date_ref     = Reference(ws3, min_col=1, min_row=data_start_row, max_row=data_end_row)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CHARTS — single column, full width, below summary table
+    # ══════════════════════════════════════════════════════════════════════════
+    cur_row = grand_row_n + 3
+
+    def section_title(txt, row):
+        ws4.merge_cells(f'A{row}:H{row}')
+        c = ws4.cell(row=row, column=1, value=txt)
+        c.font = Font(bold=True, name='Arial', size=11, color='FFFFFF')
+        c.fill = SUBHDR_FILL; c.alignment = CENTER
+        ws4.row_dimensions[row].height = 20
+        return row + 1
+
+    def place(chart, anchor_row):
+        chart.width  = CHART_W
+        chart.height = CHART_H
+        chart.anchor = f'A{anchor_row}'
+        ws4.add_chart(chart)
+        return anchor_row + rows_per_chart
+
+    # Chart 1: PIE
+    cur_row = section_title('Chart 1 \u2014 Consumption Distribution by Unit (Pie)', cur_row)
+    pie = PieChart()
+    pie.title  = 'Consumption Distribution by Unit'
+    pie.style  = 26
+    pie.dataLabels = DataLabelList()
+    pie.dataLabels.showCatName = True
+    pie.dataLabels.showVal     = True
+    pie.dataLabels.showPercent = True
+    pie.dataLabels.showSerName = False
+    pie.add_data(totals_data_ref, titles_from_data=True)
+    pie.set_categories(totals_label_ref)
+    pie.series[0].title = SeriesLabel(v='Total (m\u00b3)')
+    cur_row = place(pie, cur_row)
+
+    # Chart 2: BAR horizontal
+    cur_row = section_title('Chart 2 \u2014 Total Water Consumption by Unit (m\u00b3)', cur_row)
+    bar_total = BarChart()
+    bar_total.type = 'bar'; bar_total.barDir = 'bar'; bar_total.grouping = 'clustered'
+    bar_total.title = 'Total Water Consumption by Unit (m\u00b3)'
+    bar_total.style = 26
+    bar_total.y_axis.title = 'Unit'; bar_total.x_axis.title = 'm\u00b3'
+    bar_total.dataLabels = DataLabelList()
+    bar_total.dataLabels.showVal = True
+    bar_total.add_data(totals_data_ref, titles_from_data=True)
+    bar_total.set_categories(totals_label_ref)
+    bar_total.series[0].title = SeriesLabel(v='Total (m\u00b3)')
+    cur_row = place(bar_total, cur_row)
+
+    # Chart 3: LINE daily trend
+    cur_row = section_title('Chart 3 \u2014 Daily Consumption Trend by Unit (m\u00b3/day)', cur_row)
+    line_chart = LineChart()
+    line_chart.title    = 'Daily Consumption Trend by Unit (m\u00b3/day)'
+    line_chart.style    = 10; line_chart.smooth = True; line_chart.grouping = 'standard'
+    line_chart.y_axis.title = 'm\u00b3/day'; line_chart.x_axis.title = 'Date'
+    for i, prod in enumerate(active_cols):
+        dr = Reference(ws3, min_col=i+2, min_row=data_start_row-1, max_row=data_end_row)
+        line_chart.add_data(dr, titles_from_data=True)
+        area = short_area(prod)
+        line_chart.series[i].title = SeriesLabel(v=f'{prod} - {area}' if area else prod)
+    line_chart.set_categories(date_ref)
+    cur_row = place(line_chart, cur_row)
+
+    # Chart 4: STACKED COL
+    cur_row = section_title('Chart 4 \u2014 Daily Consumption Stacked (m\u00b3)', cur_row)
+    stacked = BarChart()
+    stacked.type = 'col'; stacked.barDir = 'col'; stacked.grouping = 'stacked'
+    stacked.title = 'Daily Consumption \u2014 Stacked (m\u00b3)'
+    stacked.style = 10
+    stacked.y_axis.title = 'm\u00b3/day'; stacked.x_axis.title = 'Date'
+    for i, prod in enumerate(active_cols):
+        dr = Reference(ws3, min_col=i+2, min_row=data_start_row-1, max_row=data_end_row)
+        stacked.add_data(dr, titles_from_data=True)
+        area = short_area(prod)
+        stacked.series[i].title = SeriesLabel(v=f'{prod} - {area}' if area else prod)
+    stacked.set_categories(date_ref)
+    cur_row = place(stacked, cur_row)
+
+    # Chart 5: AREA cumulative
+    cur_row = section_title('Chart 5 \u2014 Cumulative Consumption (m\u00b3)', cur_row)
+    area_chart = AreaChart()
+    area_chart.title    = 'Cumulative Consumption (m\u00b3)'
+    area_chart.style    = 10; area_chart.grouping = 'standard'
+    area_chart.y_axis.title = 'Cumulative m\u00b3'; area_chart.x_axis.title = 'Date'
+    for j, prod in enumerate(active_cols):
+        dr = Reference(ws4, min_col=HC_START+j, min_row=HLP_ROW, max_row=hc_end)
+        area_chart.add_data(dr, titles_from_data=True)
+    area_chart.set_categories(cum_date_ref)
+    cur_row = place(area_chart, cur_row)
+
+    # Chart 6: CLUSTERED COL avg & max
+    cur_row = section_title('Chart 6 \u2014 Avg & Max Daily Consumption by Unit (m\u00b3/day)', cur_row)
+    grouped_bar = BarChart()
+    grouped_bar.type = 'col'; grouped_bar.barDir = 'col'; grouped_bar.grouping = 'clustered'
+    grouped_bar.title = 'Avg & Max Daily Consumption by Unit (m\u00b3/day)'
+    grouped_bar.style = 10; grouped_bar.y_axis.title = 'm\u00b3/day'
+    grouped_bar.dataLabels = DataLabelList()
+    grouped_bar.dataLabels.showVal = True
+    grouped_bar.add_data(am_avg_ref, titles_from_data=True)
+    grouped_bar.add_data(am_max_ref, titles_from_data=True)
+    grouped_bar.set_categories(am_cat_ref)
+    grouped_bar.series[0].graphicalProperties.solidFill = '0EA5E9'
+    grouped_bar.series[1].graphicalProperties.solidFill = 'EF4444'
+    cur_row = place(grouped_bar, cur_row)
+
+    buf = _io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
 
 
 # ============================================================================
@@ -1058,26 +1593,54 @@ with tab_ov:
             use_container_width=True
         )
 
-    # ── HTML Export ──────────────────────────────────────────────────────────
+    # ── Export ────────────────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("### 📥 Export Report")
     st.info(
-        "Download a **standalone HTML report** — fully interactive charts, "
-        "works offline without any internet connection or Python installation."
+        "**HTML** — interactive charts, works offline. &nbsp;|&nbsp; "
+        "**Excel** — 4 sheets: Summary, Raw Data, Water Usage (m³), Charts."
     )
-    with st.spinner("Building HTML report..."):
-        html_report = generate_html_report(
-            cons_active, cons_totals, loc_map, selected_prods,
-            period_str, total_all, n_days
+
+    exp_col1, exp_col2 = st.columns(2)
+
+    with exp_col1:
+        with st.spinner("Building HTML report..."):
+            html_report = generate_html_report(
+                cons_active, cons_totals, loc_map, selected_prods,
+                period_str, total_all, n_days
+            )
+        fname_html = f"water_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.html"
+        st.download_button(
+            label="⬇️ Download HTML Report (Interactive)",
+            data=html_report.encode('utf-8'),
+            file_name=fname_html,
+            mime='text/html',
+            use_container_width=True,
         )
-    fname = f"water_consumption_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.html"
-    st.download_button(
-        label="⬇️ Download Full Report (HTML)",
-        data=html_report.encode('utf-8'),
-        file_name=fname,
-        mime='text/html',
-        use_container_width=True,
-    )
+
+    with exp_col2:
+        with st.spinner("Building Excel report..."):
+            # Pass the already-filtered raw_df subset for selected units
+            raw_for_excel = raw_df[raw_df['Pompa'].isin(selected_prods)].copy()
+            excel_bytes = generate_excel_report(
+                raw_filtered=raw_for_excel,
+                cons=cons,
+                cons_active=cons_active,
+                cons_totals=cons_totals,
+                loc_map=loc_map,
+                selected_prods=selected_prods,
+                period_str=period_str,
+                total_all=total_all,
+                n_days=n_days,
+            )
+        fname_xlsx = f"water_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        st.download_button(
+            label="⬇️ Download Excel Report (.xlsx)",
+            data=excel_bytes,
+            file_name=fname_xlsx,
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            use_container_width=True,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
