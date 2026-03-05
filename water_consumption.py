@@ -1827,7 +1827,7 @@ def generate_html_report(
   <div class="logo">💧</div>
   <div>
     <div class="header-title">Water Consumption Dashboard</div>
-    <div class="header-sub">Daily water consumption analysis from Water Meter Raw Data — Plant 1</div>
+    <div class="header-sub">Daily water consumption analysis from Water Meter Raw Data</div>
   </div>
   <div class="badge">📅 {period_str} &nbsp;|&nbsp; {n_days} days</div>
 </div>
@@ -1941,7 +1941,7 @@ with st.sidebar:
     uploaded = st.file_uploader(
         "Upload waterawdata file (*.xlsx)",
         type=['xlsx'],
-        help="Upload waterawdata_GI.xlsx or any file with the same format"
+        help="Upload waterawdata.xlsx or any file with the same format"
     )
 
     st.markdown("---")
@@ -2616,3 +2616,4 @@ st.markdown("""
   PT Güntner Indonesia &nbsp;|&nbsp; Water Monitoring System
 </div>
 """, unsafe_allow_html=True)
+
