@@ -128,7 +128,6 @@ def load_water_bill(file_bytes: bytes) -> pd.DataFrame:
     df['FY']    = df['Date'].apply(get_fiscal_year)
     return df
 
-
 _COLOR_PALETTE = [
     '#0ea5e9', '#10b981', '#f59e0b', '#ef4444',
     '#8b5cf6', '#ec4899', '#06b6d4', '#f97316',
@@ -205,7 +204,16 @@ def load_raw_data(file_bytes: bytes) -> pd.DataFrame:
     df['Date']            = pd.to_datetime(df['Date'], errors='coerce')
     df['Water_Indicator'] = pd.to_numeric(df['Water_Indicator'], errors='coerce')
     df = df.dropna(subset=['Date', 'Water_Indicator'])
-    df['Pompa'] = df['Pompa'].astype(str).str.strip()
+    # Normalisasi nama Pompa:
+    # 1. strip spasi di ujung
+    # 2. strip karakter non-alphanumeric di ujung (underscore, titik, strip, dll)
+    # 3. collapse spasi ganda di tengah
+    # Contoh: "PROD 2.5_" → "PROD 2.5", "DOM 1.1 " → "DOM 1.1"
+    df['Pompa'] = (df['Pompa'].astype(str)
+                              .str.strip()
+                              .str.replace(r'[\s_\-\.]+$', '', regex=True)   # trailing
+                              .str.replace(r'^[\s_\-\.]+', '', regex=True)   # leading
+                              .str.replace(r'\s+', ' ', regex=True))         # internal
     return df
 
 
@@ -2044,11 +2052,7 @@ with st.sidebar:
 
         if not raw_df.empty:
             available_prods = sorted(raw_df['Pompa'].unique().tolist())
-            # Default: PROD units. Smart Analysis butuh PROD+DOM+SIPA — include semua yg ada
-            smart_units = PROD_UNITS + DOM_UNITS + SIPA_P1
-            default_sel = [p for p in smart_units if p in available_prods]
-            if not default_sel:
-                default_sel = [p for p in DEFAULT_PRODS if p in available_prods]
+            default_sel     = [p for p in DEFAULT_PRODS if p in available_prods]
             if not default_sel:
                 default_sel = available_prods[:min(7, len(available_prods))]
 
@@ -2056,7 +2060,7 @@ with st.sidebar:
                 "Select Units",
                 options=available_prods,
                 default=default_sel,
-                help="Select one or more units to analyse. Smart Analysis membutuhkan unit PROD, DOM, dan SIPA."
+                help="Select one or more units to analyse"
             )
 
             st.markdown("---")
@@ -2214,8 +2218,7 @@ st.markdown(
 # TABS
 # ============================================================================
 tab_ov, tab_daily, tab_table, tab_raw, tab_anom, tab_smart = st.tabs([
-    "📊 Overview", "📈 Daily Analysis", "📋 Data Table",
-    "🗃️ Raw Data", "🚨 Anomaly Report", "💡 Smart Analysis"
+    "📊 Overview", "📈 Daily Analysis", "📋 Data Table", "🗃️ Raw Data", "🚨 Anomaly Report", "💡 Smart Analysis"
 ])
 
 
@@ -2225,32 +2228,113 @@ tab_ov, tab_daily, tab_table, tab_raw, tab_anom, tab_smart = st.tabs([
 with tab_ov:
     st.markdown("## Performance by Unit")
 
-    cols_kpi = st.columns(len(selected_prods))
-    for i, prod in enumerate(selected_prods):
-        if prod not in cons.columns:
+    # Group units by category: SIPA → PROD → DOM → other
+    def get_category(p: str) -> str:
+        pu = p.upper()
+        if pu.startswith('SIPA'): return 'SIPA'
+        if pu.startswith('PROD'): return 'PROD'
+        if pu.startswith('DOM'):  return 'DOM'
+        return 'OTHER'
+
+    CAT_ORDER  = ['SIPA', 'PROD', 'DOM', 'OTHER']
+    CAT_LABELS = {'SIPA': '💧 SIPA — Water Intake',    'PROD': '⚙️ PROD — Production',
+                  'DOM':  '🏠 DOM — Domestic',          'OTHER': '📦 Other'}
+    CAT_COLORS = {'SIPA': '#0ea5e9', 'PROD': '#10b981', 'DOM': '#f59e0b', 'OTHER': '#94a3b8'}
+
+    grouped: dict = {c: [] for c in CAT_ORDER}
+    for p in selected_prods:
+        if p in cons.columns:
+            grouped[get_category(p)].append(p)
+
+    # Separate SIPA (intake) from distribution units
+    sipa_units_ov = grouped['SIPA']
+    dist_units_ov = grouped['PROD'] + grouped['DOM'] + grouped['OTHER']
+
+    sipa_total_ov = sum(float(cons_totals.get(p, 0)) for p in sipa_units_ov)
+    dist_total_ov = sum(float(cons_totals.get(p, 0)) for p in dist_units_ov)
+
+    for cat in CAT_ORDER:
+        prods_in_cat = grouped[cat]
+        if not prods_in_cat:
             continue
-        area       = loc_map.get(prod, '')
-        area_short = area.replace(f'{prod} - ', '').replace(prod, '').strip(' -')
-        total_v    = float(cons_totals.get(prod, 0))
-        d_vals     = cons_active[prod][cons_active[prod] > 0] if prod in cons_active else pd.Series()
-        avg_v      = float(d_vals.mean()) if len(d_vals) > 0 else 0
-        max_v      = float(d_vals.max())  if len(d_vals) > 0 else 0
-        pct_v      = total_v / total_all * 100 if total_all > 0 else 0
-        color      = get_unit_color(prod)
-        with cols_kpi[i]:
-            st.markdown(
-                kpi_card_html(prod, area_short, total_v, avg_v, max_v, pct_v, color),
-                unsafe_allow_html=True
-            )
+
+        col_c     = CAT_COLORS[cat]
+        cat_total = sum(float(cons_totals.get(p, 0)) for p in prods_in_cat)
+
+        # SIPA: show vs total intake; PROD/DOM: show vs total distribution
+        if cat == 'SIPA':
+            pct_label = f'Total Intake: <b>{cat_total:,.1f} m³</b>'
+            suffix    = ''
+        else:
+            pct_ref   = dist_total_ov if dist_total_ov > 0 else 1
+            cat_pct   = cat_total / pct_ref * 100
+            pct_label = f'Total: <b>{cat_total:,.1f} m³</b> &nbsp;({cat_pct:.1f}% of distribution)'
+            suffix    = ''
+
+        st.markdown(
+            f'<div style="background:linear-gradient(90deg,{col_c}22,{col_c}08);'
+            f'border-left:4px solid {col_c};border-radius:8px;padding:8px 16px;'
+            f'margin:18px 0 8px 0;display:flex;align-items:center;gap:16px;">'
+            f'<span style="font-size:15px;font-weight:700;color:{col_c};">'
+            f'{CAT_LABELS[cat]}</span>'
+            f'<span style="font-size:13px;color:#64748b;margin-left:auto;">'
+            f'{pct_label}{suffix}</span></div>',
+            unsafe_allow_html=True
+        )
+
+        cols_kpi = st.columns(len(prods_in_cat))
+        for i, prod in enumerate(prods_in_cat):
+            area       = loc_map.get(prod, '')
+            area_short = area.replace(f'{prod} - ', '').replace(prod, '').strip(' -')
+            total_v    = float(cons_totals.get(prod, 0))
+            d_vals     = cons_active[prod][cons_active[prod] > 0] if prod in cons_active else pd.Series()
+            avg_v      = float(d_vals.mean()) if len(d_vals) > 0 else 0
+            max_v      = float(d_vals.max())  if len(d_vals) > 0 else 0
+            # For SIPA: pct of total intake; for others: pct of distribution
+            ref_total  = sipa_total_ov if cat == 'SIPA' else (dist_total_ov if dist_total_ov > 0 else 1)
+            pct_v      = total_v / ref_total * 100 if ref_total > 0 else 0
+            color      = get_unit_color(prod)
+            with cols_kpi[i]:
+                st.markdown(
+                    kpi_card_html(prod, area_short, total_v, avg_v, max_v, pct_v, color),
+                    unsafe_allow_html=True
+                )
 
     st.markdown("---")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("💧 Total Consumption", f"{total_all:,.1f} m³")
-    m2.metric("📅 Days of Data",       f"{n_days} days")
-    avg_daily_total = float(cons_active.sum(axis=1).mean()) if len(cons_active) > 0 else 0
-    m3.metric("📊 Average / Day",     f"{avg_daily_total:,.1f} m³")
-    # FIX: Show peak day with date
-    m4.metric("🔺 Peak Day", f"{peak_val:,.1f} m³", delta=peak_date_str)
+
+    # ── KPI summary metrics — SIPA separate from distribution ────────────────
+    has_sipa_ov = bool(sipa_units_ov)
+    has_dist_ov = bool(dist_units_ov)
+
+    if has_sipa_ov and has_dist_ov:
+        # Show both intake and distribution
+        avg_dist = float(cons_active[dist_units_ov].sum(axis=1).mean()) if dist_units_ov else 0
+        avg_sipa = float(cons_active[sipa_units_ov].sum(axis=1).mean()) if sipa_units_ov else 0
+        balance  = sipa_total_ov - dist_total_ov
+        bal_sign = "+" if balance >= 0 else ""
+        bal_col  = "normal" if balance >= 0 else "inverse"
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("💧 SIPA Intake",       f"{sipa_total_ov:,.1f} m³",
+                  help="Total air masuk dari sumur/sumber")
+        m2.metric("📤 Total Distribution", f"{dist_total_ov:,.1f} m³",
+                  delta=f"{bal_sign}{balance:,.0f} m³ balance",
+                  delta_color=bal_col,
+                  help="PROD + DOM. Delta = SIPA − Distribution")
+        m3.metric("📅 Days of Data",       f"{n_days} days")
+        avg_daily_total = avg_dist
+        m4.metric("📊 Avg Distribution/Day", f"{avg_dist:,.1f} m³",
+                  help="Rata-rata distribusi harian (PROD+DOM)")
+        m5.metric("🔺 Peak Day", f"{peak_val:,.1f} m³", delta=peak_date_str)
+    else:
+        # No SIPA selected — show normal consumption metrics
+        dist_total_show = dist_total_ov if has_dist_ov else total_all
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("💧 Total Consumption", f"{dist_total_show:,.1f} m³")
+        m2.metric("📅 Days of Data",       f"{n_days} days")
+        avg_daily_total = float(cons_active[dist_units_ov].sum(axis=1).mean()) if dist_units_ov else float(cons_active.sum(axis=1).mean())
+        m3.metric("📊 Average / Day",     f"{avg_daily_total:,.1f} m³")
+        m4.metric("🔺 Peak Day", f"{peak_val:,.1f} m³", delta=peak_date_str)
 
     st.markdown("---")
     st.markdown("## Visualisations")
@@ -2732,7 +2816,7 @@ with tab_smart:
     </div>
     """, unsafe_allow_html=True)
 
-    # ── FY selector (top-right, sebelum data prep) ───────────────────────────
+    # ── FY selector ───────────────────────────────────────────────────────────
     if not raw_df.empty:
         _fy_all = sorted(set(
             get_fiscal_year(d) for d in pd.to_datetime(raw_df['Date'])
@@ -2802,7 +2886,8 @@ with tab_smart:
 
     wb_total = 0.0
     if wb_df is not None:
-        wb_sub   = wb_df if selected_fy == 'All FY' else                    wb_df[wb_df['FY'] == int(selected_fy.replace('FY ', ''))]
+        wb_sub   = wb_df if selected_fy == 'All FY' else \
+                   wb_df[wb_df['FY'] == int(selected_fy.replace('FY ', ''))]
         wb_total = float(wb_sub['Volume_m3'].sum())
     sipa_bill_gap = total_sipa1 - wb_total if wb_total > 0 else None
 
@@ -2856,7 +2941,7 @@ with tab_smart:
         unsafe_allow_html=True
     )
 
-    # ── Hierarchical Report Table ────────────────────────────────────────────
+    # ── Hierarchical Report Table ─────────────────────────────────────────────
     st.markdown("---")
 
     all_fy_nums = sorted(set(
@@ -2871,7 +2956,6 @@ with tab_smart:
         return {r['Month']: round(float(r['Total']), 0) for _, r in g.iterrows()}
 
     def get_mo_unit(cons_df, unit, fy_v):
-        """Monthly values for a single unit in a given FY."""
         if unit not in cons_df.columns: return {}
         tmp = cons_df[[unit]].copy()
         tmp.index = pd.to_datetime(tmp.index)
@@ -2892,33 +2976,29 @@ with tab_smart:
         yb = 0.0
         if wb_df is not None:
             yb = float(wb_df[wb_df['FY'] == fy_v]['Volume_m3'].sum())
-        yg     = ys - yp - yd
+        # Total distribution per month
+        all_months = sorted(set(list(prod_mo.keys()) + list(dom_mo.keys()) + list(sipa_mo.keys())),
+                            key=lambda m: MONTH_ORDER.index(m) if m in MONTH_ORDER else 99)
+        dist_mo = {m: (prod_mo.get(m, 0) + dom_mo.get(m, 0)) for m in all_months
+                   if prod_mo.get(m, 0) + dom_mo.get(m, 0) > 0}
+        ydist = yp + yd
+        yg     = ys - ydist
         yg_pct = round(yg / ys * 100, 1) if ys > 0 else 0
-        # per-unit monthly for detail rows
         prod_unit_mo = {u: get_mo_unit(cons_base, u, fy_v) for u in prod_avail}
         dom_unit_mo  = {u: get_mo_unit(cons_base, u, fy_v) for u in dom_avail}
         sipa_unit_mo = {u: get_mo_unit(cons_base, u, fy_v) for u in sipa1_avail}
         combined_rows_sa.append({
             'fy_v': fy_v, 'prod_mo': prod_mo, 'dom_mo': dom_mo,
-            'sipa_mo': sipa_mo, 'ytd_prod': yp, 'ytd_dom': yd,
+            'sipa_mo': sipa_mo, 'dist_mo': dist_mo,
+            'ytd_prod': yp, 'ytd_dom': yd, 'ytd_dist': ydist,
             'ytd_sipa': ys, 'ytd_bill': yb, 'ytd_gap': yg, 'ytd_gap_pct': yg_pct,
             'prod_unit_mo': prod_unit_mo,
             'dom_unit_mo':  dom_unit_mo,
             'sipa_unit_mo': sipa_unit_mo,
         })
 
-    # FY filter
-    if all_fy_nums:
-        _fy_label_opts = ['All FY'] + [f'FY {int(y)}' for y in all_fy_nums]
-    else:
-        _fy_label_opts = ['All FY']
-
-    col_title, _ = st.columns([3, 1])
-    with col_title:
-        st.markdown("#### 📋 Water Consumption Report — Fiscal Year")
-
-    # Filter FY
-    show_fys = all_fy_nums if selected_fy == 'All FY' else                [int(selected_fy.replace('FY ', ''))]
+    show_fys = all_fy_nums if selected_fy == 'All FY' else \
+               [int(selected_fy.replace('FY ', ''))]
 
     months_present_sa = [m for m in MONTH_ORDER if any(
         get_mo_totals(monthly_prod, fy).get(m) or
@@ -2927,11 +3007,10 @@ with tab_smart:
         for fy in show_fys
     )]
 
-    # ── Build HTML table ──────────────────────────────────────────────────────
+    # ── Build HTML table with collapsible rows via JS ──────────────────────
     mo_cols = months_present_sa
 
     def v(val):
-        """Format number: 0 → '—', else comma-separated."""
         if val is None or val == 0: return '<span style="color:#cbd5e1">—</span>'
         return f'{int(val):,}'
 
@@ -2950,42 +3029,38 @@ with tab_smart:
         cols_html += f'<th style="{th_style}">Balance m³</th>'
         cols_html += f'<th style="{th_style}">Bal %</th>'
 
-        # CSS: no hover override (preserve row color), collapse toggle style
-        html = f"""
+        html = """
         <style>
-          .sa-table {{border-collapse:collapse;width:100%;font-family:Inter,sans-serif;font-size:13px;}}
-          .sa-table td, .sa-table th {{border:1px solid #e2e8f0;padding:7px 8px;}}
-          .sa-toggle {{cursor:pointer;user-select:none;}}
-          .sa-toggle:hover opacity:0.85;}}
-          .sa-chevron {{display:inline-block;transition:transform .2s;margin-right:6px;font-size:11px;}}
-          .sa-chevron.collapsed {{transform:rotate(-90deg);}}
+          .sa-table {border-collapse:collapse;width:100%;font-family:Inter,sans-serif;font-size:13px;}
+          .sa-table td, .sa-table th {border:1px solid #e2e8f0;padding:7px 8px;}
+          .sa-toggle {cursor:pointer;user-select:none;}
+          .sa-chevron {display:inline-block;transition:transform .2s;margin-right:6px;font-size:11px;}
+          .sa-chevron.collapsed {transform:rotate(-90deg);}
         </style>
         <script>
-        function saToggle(groupId) {{
+        function saToggle(groupId) {
           var rows = document.querySelectorAll('.' + groupId);
           var chev = document.getElementById('chev-' + groupId);
           var hidden = rows[0] && rows[0].style.display === 'none';
-          rows.forEach(function(r) {{ r.style.display = hidden ? '' : 'none'; }});
+          rows.forEach(function(r) { r.style.display = hidden ? '' : 'none'; });
           if (chev) chev.classList.toggle('collapsed', !hidden);
-        }}
+        }
         </script>
         <div style="overflow-x:auto;">
         <table class="sa-table">
-          <thead><tr>{cols_html}</tr></thead>
+          <thead><tr>""" + cols_html + """</tr></thead>
           <tbody>
         """
-
-        ncols = len(mo_cols) + 1 + (1 if wb_df is not None else 0) + 2  # total td count
 
         for fy_v in show_fys:
             cr = next((r for r in combined_rows_sa if r['fy_v'] == fy_v), None)
             if not cr: continue
 
-            fid     = f"fy{int(fy_v)}"
+            fid      = f"fy{int(fy_v)}"
             fy_label = f"FY {int(fy_v)}"
 
-            # ── FY Header ─────────────────────────────────────────────────
-            fy_s = "background:#0c4a6e;color:white;font-weight:800;font-size:14px;"
+            # ── FY Header row ─────────────────────────────────────────────
+            fy_s   = "background:#0c4a6e;color:white;font-weight:800;font-size:14px;"
             gap_bg = ("#dcfce7;color:#166534" if cr["ytd_gap"] > 200
                       else "#fee2e2;color:#991b1b" if cr["ytd_gap"] < -200
                       else "#fef9c3;color:#854d0e")
@@ -3002,9 +3077,8 @@ with tab_smart:
             row += '</tr>'
             html += row
 
-            # helper: build a collapsible section header row (toggle sub-units)
-            def section_header(label, mo_data, ytd_val, bg, sid):
-                s = (f"background:{bg};color:white;font-weight:700;")
+            def section_header(label, mo_data, ytd_val, bg, sid, show_dist_cols=True):
+                s = f"background:{bg};color:white;font-weight:700;"
                 r  = f'<tr class="{fid} sa-toggle" onclick="saToggle(\'{sid}\')">'
                 r += (f'<td style="padding:7px 12px;{s}">'
                       f'<span class="sa-chevron" id="chev-{sid}">▼</span>{label}</td>')
@@ -3013,8 +3087,9 @@ with tab_smart:
                 r += f'<td style="text-align:center;{s};font-weight:800;">{v(ytd_val)}</td>'
                 if wb_df is not None:
                     r += f'<td style="text-align:center;{s}"></td>'
-                r += f'<td style="text-align:center;{s}"></td>'
-                r += f'<td style="text-align:center;{s}"></td>'
+                if show_dist_cols:
+                    r += f'<td style="text-align:center;{s}"></td>'
+                    r += f'<td style="text-align:center;{s}"></td>'
                 r += '</tr>'
                 return r
 
@@ -3060,6 +3135,27 @@ with tab_smart:
                                    "#f59e0b", sid_dom)
             html += sub_rows(cr['dom_unit_mo'], "#92400e", "#fffbeb", sid_dom)
 
+            # ── Total Distribution (PROD + DOM) — NEW ROW ─────────────────
+            dist_s = "background:#7c3aed;color:white;font-weight:800;"
+            dist_ytd_v = cr['ytd_dist']
+            row  = f'<tr class="{fid}">'
+            row += (f'<td style="padding:7px 12px;{dist_s}">📤 Total Distribution (PROD+DOM)</td>')
+            for m in mo_cols:
+                row += f'<td style="text-align:center;{dist_s}">{v(cr["dist_mo"].get(m,0))}</td>'
+            row += f'<td style="text-align:center;{dist_s}font-weight:900;">{v(dist_ytd_v)}</td>'
+            if wb_df is not None:
+                row += f'<td style="text-align:center;{dist_s}"></td>'
+            # Balance vs SIPA
+            gap_v = cr['ytd_sipa'] - dist_ytd_v
+            gbg   = "#86efac" if gap_v >= 0 else "#fca5a5"
+            gfg   = "#14532d" if gap_v >= 0 else "#7f1d1d"
+            sign  = "+" if gap_v >= 0 else ""
+            row += f'<td style="text-align:center;background:{gbg};color:{gfg};font-weight:800;">{sign}{int(gap_v):,}</td>'
+            gpct  = round(gap_v / cr['ytd_sipa'] * 100, 1) if cr['ytd_sipa'] else 0
+            row += f'<td style="text-align:center;background:{gbg};color:{gfg};font-weight:800;">{sign}{gpct:.1f}%</td>'
+            row += '</tr>'
+            html += row
+
             # ── Water Bill ────────────────────────────────────────────────
             if wb_df is not None and cr['ytd_bill'] > 0:
                 bill_mo = {wrow['Month']: round(float(wrow['Volume_m3']), 0)
@@ -3080,25 +3176,37 @@ with tab_smart:
                 row += '</tr>'
                 html += row
 
-            # Spacer
+            # Spacer row
             html += f'<tr><td colspan="100" style="background:#f1f5f9;padding:3px;"></td></tr>'
 
         html += "</tbody></table></div>"
         return html
 
+    col_title, _ = st.columns([3, 1])
+    with col_title:
+        st.markdown("#### 📋 Water Consumption Report — Fiscal Year")
+
     report_html = build_report_html(show_fys, combined_rows_sa, mo_cols, wb_df)
-    st.markdown(report_html, unsafe_allow_html=True)
+    import streamlit.components.v1 as _components
+    # Estimate table height: ~36px per row, min 400
+    n_rows_est = sum(
+        2 + len(cr.get('sipa_unit_mo', {})) + len(cr.get('prod_unit_mo', {})) + len(cr.get('dom_unit_mo', {})) + 4
+        for cr in combined_rows_sa if cr['fy_v'] in show_fys
+    )
+    table_height = max(500, min(n_rows_est * 36 + 120, 2400))
+    _components.html(report_html, height=table_height, scrolling=True)
     st.caption("Satuan: m³ · Balance = SIPA – (PROD+DOM) · 🟢 >200 wajar · 🔴 <-200 investigasi · Klik header baris untuk expand/collapse")
 
-    # Download CSV
+    # ── Download CSV ──────────────────────────────────────────────────────────
     dl_rows = []
     for fy_v in show_fys:
         cr = next((r for r in combined_rows_sa if r['fy_v'] == fy_v), None)
         if not cr: continue
         for section, mo_data, ytd in [
-            ('SIPA Intake', cr['sipa_mo'], cr['ytd_sipa']),
-            ('PROD Total',  cr['prod_mo'], cr['ytd_prod']),
-            ('DOM Total',   cr['dom_mo'],  cr['ytd_dom']),
+            ('SIPA Intake',      cr['sipa_mo'], cr['ytd_sipa']),
+            ('PROD Total',       cr['prod_mo'], cr['ytd_prod']),
+            ('DOM Total',        cr['dom_mo'],  cr['ytd_dom']),
+            ('Total Dist P+D',   cr['dist_mo'], cr['ytd_dist']),
         ]:
             row = {'FY': f'FY {int(fy_v)}', 'Category': section}
             for m in MONTH_ORDER:
@@ -3145,7 +3253,8 @@ with tab_smart:
                 continue
             chart_rows_sa.append({
                 'Label': f"{mo_v} FY{str(int(fy_v))[2:]}",
-                'SIPA': sv, 'PROD': pv, 'DOM': dv, 'Bill': bv
+                'SIPA': sv, 'PROD': pv, 'DOM': dv, 'Bill': bv,
+                'Dist': pv + dv
             })
 
     if chart_rows_sa:
@@ -3189,21 +3298,18 @@ with tab_smart:
         )
         st.plotly_chart(fig_sa, use_container_width=True)
 
-        # Gap chart (only when both SIPA and distribution exist)
-        if ch_sa['SIPA'].sum() > 0 and (ch_sa['PROD'].sum() + ch_sa['DOM'].sum()) > 0:
-            ch_sa['Gap'] = ch_sa['SIPA'] - ch_sa['PROD'] - ch_sa['DOM']
+        if ch_sa['SIPA'].sum() > 0 and ch_sa['Dist'].sum() > 0:
+            ch_sa['Gap'] = ch_sa['SIPA'] - ch_sa['Dist']
             fig_gap_sa = go.Figure(go.Bar(
                 x=ch_sa['Label'],
                 y=ch_sa['Gap'],
-                marker_color=['#10b981' if g >= 0 else '#ef4444'
-                              for g in ch_sa['Gap']],
-                text=[f"{v:+,.0f}" for v in ch_sa['Gap']],
+                marker_color=['#10b981' if g >= 0 else '#ef4444' for g in ch_sa['Gap']],
+                text=[f"{vv:+,.0f}" for vv in ch_sa['Gap']],
                 textposition='outside',
                 textfont=dict(size=10),
                 hovertemplate='Gap: %{y:+,.0f} m³<extra></extra>'
             ))
-            fig_gap_sa.add_hline(y=0, line_dash='dash',
-                                  line_color='#94a3b8', line_width=1)
+            fig_gap_sa.add_hline(y=0, line_dash='dash', line_color='#94a3b8', line_width=1)
             fig_gap_sa.update_layout(
                 title=dict(text='Gap Bulanan: SIPA – (PROD + DOM)',
                            font=dict(size=13, color='#1e293b')),
@@ -3236,36 +3342,7 @@ with tab_smart:
             'Avg': 'Avg/Bln (m³)',      'Mn':  'Min (m³)',
             'Mx':  'Max (m³)',           'N':   'Bulan Data'
         })
-        fmt_wb_map = {
-            c: '{:,.0f}' for c in
-            ['Total Volume (m³)', 'Avg/Bln (m³)', 'Min (m³)', 'Max (m³)']
-        }
-        fmt_wb_map.update({
-            'Total Tagihan (Rp)': 'Rp {:,.0f}',
-            'Rp/m³':              'Rp {:,.0f}'
-        })
-        st.dataframe(
-            wb_grp.style
-                .format({k: v for k, v in fmt_wb_map.items()
-                         if k in wb_grp.columns})
-                .set_properties(**{
-                    'text-align': 'center', 'border': '1px solid #e2e8f0',
-                    'padding': '8px 12px', 'font-size': '13px'
-                })
-                .set_properties(subset=['FY'], **{
-                    'background-color': '#0c4a6e',
-                    'color': 'white', 'font-weight': 'bold'
-                })
-                .set_table_styles([{
-                    'selector': 'thead th',
-                    'props': [
-                        ('background-color', '#1e3a5f'), ('color', 'white'),
-                        ('font-weight', 'bold'), ('text-align', 'center'),
-                        ('padding', '10px')
-                    ]
-                }]),
-            use_container_width=True, hide_index=True
-        )
+        st.dataframe(wb_grp, use_container_width=True, hide_index=True)
     else:
         st.markdown("---")
         st.info(
@@ -3276,9 +3353,7 @@ with tab_smart:
     # ── Auto notes ────────────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("#### 📝 Catatan Otomatis")
-
     notes_sa = []
-
     if not monthly_prod.empty:
         fps = build_fy_summary(monthly_prod, prod_avail)
         if not fps.empty:
@@ -3287,75 +3362,45 @@ with tab_smart:
                 worst = fps.loc[fps['YTD'].idxmin()]
                 notes_sa.append(
                     f"🏭 **PROD** — FY tertinggi **FY {int(best['FY'])}** "
-                    f"({best['YTD']:,.0f} m³), "
-                    f"terendah **FY {int(worst['FY'])}** ({worst['YTD']:,.0f} m³)."
+                    f"({best['YTD']:,.0f} m³), terendah **FY {int(worst['FY'])}** ({worst['YTD']:,.0f} m³)."
                 )
             else:
-                notes_sa.append(
-                    f"🏭 **PROD** — Total {selected_fy}: "
-                    f"**{fps['YTD'].sum():,.0f} m³**."
-                )
-
-    if not monthly_dom.empty:
-        fds = build_fy_summary(monthly_dom, dom_avail)
-        if not fds.empty:
-            cv = (fds['YTD'].std() / fds['YTD'].mean()
-                  if fds['YTD'].mean() > 0 else 0)
-            notes_sa.append(
-                f"🏠 **DOM** — Rata-rata **{fds['YTD'].mean():,.0f} m³/FY**. "
-                + ("Konsumsi stabil antar FY." if cv < 0.2
-                   else "Ada variasi cukup besar antar FY — perlu dicek lebih lanjut.")
-            )
-
+                notes_sa.append(f"🏭 **PROD** — Total {selected_fy}: **{fps['YTD'].sum():,.0f} m³**.")
     if chart_rows_sa:
         ch2 = pd.DataFrame(chart_rows_sa)
-        if ch2['SIPA'].sum() > 0 and (ch2['PROD'].sum() + ch2['DOM'].sum()) > 0:
-            ch2['Gap'] = ch2['SIPA'] - ch2['PROD'] - ch2['DOM']
-            neg     = (ch2['Gap'] < -200).sum()
+        if ch2['SIPA'].sum() > 0 and ch2['Dist'].sum() > 0:
+            ch2['Gap'] = ch2['SIPA'] - ch2['Dist']
+            neg = (ch2['Gap'] < -200).sum()
             avg_gap = ch2['Gap'].mean()
             if neg > 0:
                 notes_sa.append(
-                    f"⚠️ **Balance** — {neg} bulan dengan gap negatif "
-                    f"(distribusi melebihi intake SIPA). "
-                    f"Perlu verifikasi meter atau cek sumber air lain."
+                    f"⚠️ **Balance** — {neg} bulan dengan gap negatif. Perlu verifikasi meter."
                 )
             else:
                 sipa_avg = ch2['SIPA'].mean()
                 pct_loss = avg_gap / sipa_avg * 100 if sipa_avg > 0 else 0
                 notes_sa.append(
                     f"✅ **Balance** — Tidak ada gap negatif signifikan. "
-                    f"Rata-rata losses ≈ {avg_gap:,.0f} m³/bulan "
-                    f"({pct_loss:.1f}% dari intake) — wajar."
+                    f"Rata-rata losses ≈ {avg_gap:,.0f} m³/bulan ({pct_loss:.1f}%) — wajar."
                 )
-
     if wb_df is not None and total_sipa1 > 0 and wb_total > 0:
         pct_diff = (total_sipa1 - wb_total) / wb_total * 100
         notes_sa.append(
-            f"💰 **SIPA vs Water Bill** — SIPA {total_sipa1:,.0f} m³ vs "
-            f"Bill {wb_total:,.0f} m³ (selisih {pct_diff:+.1f}%). "
-            + ("Sangat selaras — meter bekerja baik." if abs(pct_diff) < 5
-               else "Selisih wajar (losses / beda waktu baca)." if abs(pct_diff) < 15
+            f"💰 **SIPA vs Water Bill** — selisih {pct_diff:+.1f}%. "
+            + ("Sangat selaras." if abs(pct_diff) < 5
+               else "Selisih wajar." if abs(pct_diff) < 15
                else "Selisih besar — pertimbangkan kalibrasi meter.")
         )
     else:
-        notes_sa.append(
-            "💰 **Water Bill** — Upload file tagihan di sidebar untuk "
-            "perbandingan dengan meter SIPA."
-        )
-
+        notes_sa.append("💰 **Water Bill** — Upload file tagihan di sidebar untuk perbandingan dengan meter SIPA.")
     if not notes_sa:
-        notes_sa.append(
-            "📌 Pilih unit PROD, DOM, dan SIPA di sidebar untuk "
-            "mendapatkan analisis otomatis."
-        )
-
+        notes_sa.append("📌 Pilih unit PROD, DOM, dan SIPA di sidebar untuk analisis otomatis.")
     for n in notes_sa:
         bg  = '#f0fdf4' if '✅' in n else ('#fff7ed' if '⚠️' in n else '#f0f9ff')
         bdr = '#86efac' if '✅' in n else ('#fdba74' if '⚠️' in n else '#7dd3fc')
         st.markdown(
             f"<div style='background:{bg};border-left:4px solid {bdr};"
-            f"border-radius:6px;padding:10px 16px;margin-bottom:8px;"
-            f"font-size:13px;'>{n}</div>",
+            f"border-radius:6px;padding:10px 16px;margin-bottom:8px;font-size:13px;'>{n}</div>",
             unsafe_allow_html=True
         )
 
