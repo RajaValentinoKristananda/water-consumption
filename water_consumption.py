@@ -60,8 +60,12 @@ st.markdown("""
 # ============================================================================
 # CONSTANTS
 # ============================================================================
-DEFAULT_PRODS = ['PROD 1.3', 'PROD 1.4', 'PROD 1.5', 'PROD 1.6',
-                 'PROD 2.5', 'PROD 2.6', 'PROD 2.7']
+DEFAULT_PRODS = [
+    'PROD 1.3', 'PROD 1.4', 'PROD 1.5', 'PROD 1.6',
+    'PROD 2.5', 'PROD 2.6', 'PROD 2.7',
+    'DOM 1.1',  'DOM 1.2',  'DOM 2.1',  'DOM 2.2',  'DOM 2.3',  'DOM 2.4',
+    'SIPA 1',   'SIPA 2',
+]
 
 # ============================================================================
 # SMART ANALYSIS — CONSTANTS & HELPER FUNCTIONS
@@ -106,10 +110,10 @@ def build_fy_summary(monthly_df: pd.DataFrame, avail: list) -> pd.DataFrame:
         row = {'FY': fy}
         for m in MONTH_ORDER:
             mrow = grp[grp['Month'] == m]
-            row[m] = round(float(mrow['Total'].values[0]), 0) if len(mrow) else 0
-        row['YTD'] = round(grp['Total'].sum(), 0)
+            row[m] = round(float(mrow['Total'].values[0]), 1) if len(mrow) else 0
+        row['YTD'] = round(grp['Total'].sum(), 1)
         for u in avail:
-            row[u] = round(grp[u].sum(), 0) if u in grp.columns else 0
+            row[u] = round(grp[u].sum(), 1) if u in grp.columns else 0
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -450,13 +454,36 @@ def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
             loc_exp = float(local_expected[i])
             faktor  = round(v / loc_exp, 1) if loc_exp > 0 and v > 0 else 0
 
-            # ── PHYSICAL CAP (prioritas tertinggi untuk positif) ──────────
-            # Tangkap kasus seperti 5031 m³/hari ketika normal ~30 m³/hari.
-            # GUARD: jika usage secara absolut masih kecil (< MIN_ABSOLUTE_SPIKE),
-            # TIDAK flagging — unit intermittent seperti fin washing bisa punya
-            # median ~0.1 m³ sehingga 11 m³ terlihat "167× lokal" padahal wajar.
             if v > 0 and v > phys_i and loc_exp > 0 and v >= MIN_ABSOLUTE_SPIKE:
-                anomaly_type[i]   = 'SPIKE EKSTREM'
+                is_valid_jump = False
+
+                # Jika hari sebelumnya usage sangat negatif → ini pasangan anomali, jangan valid
+                prev_was_negative_anomaly = False
+                if i > 0:
+                    prev_usage = float(u[i-1]) if not pd.isna(u[i-1]) else 0.0
+                    if prev_usage < -500:
+                        prev_was_negative_anomaly = True
+
+                if not prev_was_negative_anomaly:
+                    if i + 1 < len(grp):
+                        next_ind   = float(ind[i + 1]) if not pd.isna(ind[i + 1]) else None
+                        curr_ind   = float(ind[i])
+                        prev_ind_v = float(ind[i - 1]) if i > 0 and not pd.isna(ind[i - 1]) else curr_ind
+                        if next_ind is not None:
+                            if next_ind >= curr_ind * 0.90:
+                                is_valid_jump = True
+
+                if is_valid_jump:
+                    pass  # biarkan NORMAL
+                else:
+                    anomaly_type[i]   = 'SPIKE EKSTREM'
+                    anomaly_reason[i] = (
+                        f'Tidak Wajar Secara Fisik — usage {v:,.0f} m³/hari adalah '
+                        f'{faktor}× ekspektasi lokal {loc_exp:.1f} m³/hari '
+                        f'(batas fisik {phys_i:,.0f} m³). '
+                        f'Kemungkinan: kamera salah baca digit, tidak ada gambar, atau data corrupt.'
+                    )
+                    continue
                 anomaly_reason[i] = (
                     f'Tidak Wajar Secara Fisik — usage {v:,.0f} m³/hari adalah '
                     f'{faktor}× ekspektasi lokal {loc_exp:.1f} m³/hari '
@@ -468,8 +495,21 @@ def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
             # ── IQR Outlier (clean stats, bukan kontaminasi) ──────────────
             # GUARD sama: jangan flag nilai kecil yang secara absolut masih wajar
             if v > iqr_upper and iqr_upper < float('inf') and v >= MIN_ABSOLUTE_SPIKE:
-                faktor2 = round(v / clean_median, 1) if clean_median > 0 else 0
-                anomaly_type[i]   = 'SPIKE EKSTREM'
+                is_valid_jump = False
+                if i + 1 < len(grp):
+                    next_ind   = float(ind[i + 1]) if not pd.isna(ind[i + 1]) else None
+                    curr_ind   = float(ind[i])
+                    if next_ind is not None and next_ind >= curr_ind * 0.90:
+                        is_valid_jump = True
+                faktor2 = round(v / clean_median, 1) if clean_median > 0 else 0  # ← moved up
+                if not is_valid_jump:
+                    anomaly_type[i]   = 'SPIKE EKSTREM'
+                    anomaly_reason[i] = (
+                        f'Outlier IQR (clean stats) — usage {v:,.0f} m³ melebihi batas wajar '
+                        f'{iqr_upper:,.0f} m³ ({faktor2}× median bersih {clean_median:.1f} m³/hari). '
+                        f'Kemungkinan: kamera salah baca, tidak ada gambar, atau data error.'
+                    )
+                    continue
                 anomaly_reason[i] = (
                     f'Outlier IQR (clean stats) — usage {v:,.0f} m³ melebihi batas wajar '
                     f'{iqr_upper:,.0f} m³ ({faktor2}× median bersih {clean_median:.1f} m³/hari). '
@@ -741,6 +781,45 @@ def apply_preprocessing(df_annotated: pd.DataFrame,
                     df.at[idx, 'preprocessed']    = True
 
     return df
+
+def get_mo_unit_from_cons(cons_sa: pd.DataFrame, df_ann: pd.DataFrame,
+                           unit: str, fy_v: int) -> dict:
+    """
+    Hitung monthly usage dari df_ann (usage_raw, spike-filtered).
+    Menggunakan usage_raw langsung — lebih akurat untuk unit intermittent
+    seperti PROD 1.5 yang nilainya kecil dan mudah hilang setelah preprocessing.
+
+    Hanya buang anomali yang jelas salah (spike besar, negatif, meter reset).
+    Nilai 0 tetap disertakan supaya bulan tidak hilang dari tabel.
+    """
+    if df_ann is not None and 'Pompa' in df_ann.columns:
+        sub = df_ann[df_ann['Pompa'] == unit].copy()
+        if not sub.empty:
+            sub = sub.sort_values('Date')
+            bad = {'SPIKE EKSTREM', 'SPIKE TINGGI',
+                   'NILAI NEGATIF', 'PERGANTIAN FLOWMETER',
+                   'INPUT ERROR / METER RESET'}
+            sub = sub[~sub['anomaly_type'].isin(bad)]
+            sub['usage'] = sub['usage_raw'].clip(lower=0)
+            sub['FY']    = sub['Date'].apply(get_fiscal_year)
+            sub['Month'] = sub['Date'].dt.strftime('%b')
+            sub_fy = sub[sub['FY'] == fy_v]
+            if not sub_fy.empty:
+                grp = sub_fy.groupby('Month')['usage'].sum()
+                return {m: round(float(v), 1) for m, v in grp.items() if v >= 0}
+
+    # Fallback ke cons_sa
+    if unit not in cons_sa.columns:
+        return {}
+    tmp = cons_sa[[unit]].copy()
+    tmp.index = pd.to_datetime(tmp.index)
+    tmp['FY']    = tmp.index.map(get_fiscal_year)
+    tmp['Month'] = tmp.index.strftime('%b')
+    sub = tmp[tmp['FY'] == fy_v]
+    if sub.empty:
+        return {}
+    grp = sub.groupby('Month')[unit].sum()
+    return {m: round(float(v), 1) for m, v in grp.items() if v >= 0}
 
 def get_anomaly_summary(df_annotated: pd.DataFrame) -> pd.DataFrame:
     """Return a clean summary DataFrame of all detected anomalies."""
@@ -2175,6 +2254,9 @@ if uploaded is None or raw_df.empty:
     st.stop()
 
 
+# Simpan full data sebelum date filter (untuk Smart Analysis FY)
+raw_df_full = raw_df.copy()
+
 # Apply date filter
 if date_from and date_to:
     raw_df = raw_df[(raw_df['Date'].dt.date >= date_from) &
@@ -2184,15 +2266,27 @@ if not selected_prods:
     st.warning("⚠️ Please select at least one unit from the sidebar.")
     st.stop()
 
+all_available_prods = sorted(raw_df_full['Pompa'].unique().tolist())
+
 with st.spinner("Processing data & detecting anomalies..."):
-    result = process_data(raw_df, selected_prods, dedup_method,
-                          preprocess_strategy)
+    result = process_data(raw_df, selected_prods, dedup_method, preprocess_strategy)
+    # Proses full data SEKALI di sini — strategy SAMA dengan user pilih
+    result_full_global = process_data(raw_df_full, all_available_prods,
+                                      dedup_method, preprocess_strategy)
 
 if not result:
     st.error("Failed to process data. Please check the file and your unit selection.")
     st.stop()
 
 pivot, cons, dedup_df, loc_map, df_annotated, df_clean = result
+
+if result_full_global:
+    _, cons_full_global, _, loc_map_full, df_ann_full, _ = result_full_global
+    cons_sa = cons_full_global.iloc[1:].copy()
+else:
+    cons_sa      = cons.iloc[1:].copy()
+    df_ann_full  = df_annotated.copy()
+    loc_map_full = loc_map.copy()
 
 cons_active = cons.iloc[1:]
 cons_totals = cons_active.sum()
@@ -2851,7 +2945,8 @@ with tab_smart:
             st.error(f"Gagal load water bill: {e}")
 
     # ── Prepare data ──────────────────────────────────────────────────────────
-    cons_work = cons_active.copy()
+    cons_work = cons_sa.copy()
+
     cons_work.index = pd.to_datetime(cons_work.index)
     cons_work['FY']    = cons_work.index.map(get_fiscal_year)
     cons_work['Month'] = cons_work.index.strftime('%b')
@@ -2860,10 +2955,39 @@ with tab_smart:
     dom_avail   = [u for u in DOM_UNITS  if u in cons_work.columns]
     sipa1_avail = [u for u in SIPA_P1    if u in cons_work.columns]
 
-    cons_base     = cons_work.drop(columns=['FY', 'Month'], errors='ignore')
-    monthly_prod  = build_monthly_fy(cons_base, prod_avail)
-    monthly_dom   = build_monthly_fy(cons_base, dom_avail)
-    monthly_sipa1 = build_monthly_fy(cons_base, sipa1_avail)
+    # Build monthly totals langsung dari annotated df (bukan dari cons yang
+    # bisa terkontaminasi forward-pass error). Ini memastikan unit intermittent
+    # seperti PROD 1.5 tetap terhitung meski ada anomali di data historis.
+    def build_monthly_from_cons(cons_df, df_ann, units, all_fy):
+        """Monthly totals dari cons_sa (flag_only, gap-aware) + spike filter."""
+        avail = [u for u in units if u in cons_df.columns]
+        if not avail:
+            return pd.DataFrame()
+        long_rows = []
+        for fy_v in all_fy:
+            for m in MONTH_ORDER:
+                total = 0.0
+                row_units = {}
+                for u in avail:
+                    d = get_mo_unit_from_cons(cons_df, df_ann, u, fy_v)
+                    val = d.get(m, 0.0)
+                    total += val
+                    row_units[u] = val
+                # Sertakan bulan jika ada setidaknya 1 unit yang punya data (> 0)
+                if any(v > 0 for v in row_units.values()):
+                    lr = {'FY': fy_v, 'Month': m, 'Total': round(total, 1)}
+                    lr.update(row_units)
+                    long_rows.append(lr)
+        return pd.DataFrame(long_rows) if long_rows else pd.DataFrame()
+
+    all_fy_for_build = sorted(set(
+        get_fiscal_year(d) for d in pd.to_datetime(raw_df_full['Date'])
+        if get_fiscal_year(d) is not None
+    ))
+
+    monthly_prod  = build_monthly_from_cons(cons_sa, df_ann_full, PROD_UNITS,  all_fy_for_build)
+    monthly_dom   = build_monthly_from_cons(cons_sa, df_ann_full, DOM_UNITS,   all_fy_for_build)
+    monthly_sipa1 = build_monthly_from_cons(cons_sa, df_ann_full, SIPA_P1,     all_fy_for_build)
 
     # ── Totals (FY-filtered) ──────────────────────────────────────────────────
     def sum_units_sa(units):
@@ -2953,7 +3077,7 @@ with tab_smart:
     def get_mo_totals(mdf, fy_v):
         if mdf.empty: return {}
         g = mdf[mdf['FY'] == fy_v]
-        return {r['Month']: round(float(r['Total']), 0) for _, r in g.iterrows()}
+        return {r['Month']: round(float(r['Total']), 1) for _, r in g.iterrows()}
 
     def get_mo_unit(cons_df, unit, fy_v):
         if unit not in cons_df.columns: return {}
@@ -2963,7 +3087,7 @@ with tab_smart:
         tmp['Month'] = tmp.index.strftime('%b')
         sub = tmp[tmp['FY'] == fy_v]
         grp = sub.groupby('Month')[unit].sum()
-        return {m: round(float(grp[m]), 0) for m in grp.index if grp[m] > 0}
+        return {m: round(float(grp[m]), 1) for m in grp.index if grp[m] > 0}
 
     combined_rows_sa = []
     for fy_v in all_fy_nums:
@@ -2984,9 +3108,9 @@ with tab_smart:
         ydist = yp + yd
         yg     = ys - ydist
         yg_pct = round(yg / ys * 100, 1) if ys > 0 else 0
-        prod_unit_mo = {u: get_mo_unit(cons_base, u, fy_v) for u in prod_avail}
-        dom_unit_mo  = {u: get_mo_unit(cons_base, u, fy_v) for u in dom_avail}
-        sipa_unit_mo = {u: get_mo_unit(cons_base, u, fy_v) for u in sipa1_avail}
+        prod_unit_mo = {u: get_mo_unit_from_cons(cons_sa, df_ann_full, u, fy_v) for u in prod_avail}
+        dom_unit_mo  = {u: get_mo_unit_from_cons(cons_sa, df_ann_full, u, fy_v) for u in dom_avail}
+        sipa_unit_mo = {u: get_mo_unit_from_cons(cons_sa, df_ann_full, u, fy_v) for u in sipa1_avail}
         combined_rows_sa.append({
             'fy_v': fy_v, 'prod_mo': prod_mo, 'dom_mo': dom_mo,
             'sipa_mo': sipa_mo, 'dist_mo': dist_mo,
@@ -3012,7 +3136,10 @@ with tab_smart:
 
     def v(val):
         if val is None or val == 0: return '<span style="color:#cbd5e1">—</span>'
-        return f'{int(val):,}'
+        f = float(val)
+        if f == int(f):
+            return f'{int(f):,}'          # bilangan bulat: tanpa desimal  → 2,906
+        return f'{f:,.1f}'                # ada desimal: tampilkan 1 angka → 6.6
 
     def build_report_html(show_fys, combined_rows_sa, mo_cols, wb_df):
         th_style = ("background:#1e3a5f;color:white;font-weight:700;text-align:center;"
